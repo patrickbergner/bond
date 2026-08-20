@@ -3,12 +3,6 @@
 The authoritative description of the BOND container format, version 1.0. [README.md](README.md) is the operator's
 guide; this is everything underneath it.
 
-**Status:** v1 is complete. Everything below is implemented, and every number in it was measured rather than
-estimated – the corruption figures in [§9](#9-what-survives-what-does-not) come out of the test suite and the timings
-in [§12](#12-where-the-time-goes) out of a real run, both reproducible with the commands given.
-
----
-
 ## 1. The pipeline
 
 One pass each way, nothing buffered to disk. A backup of a terabyte needs a terabyte of destination and nothing else.
@@ -36,24 +30,6 @@ One pass each way, nothing buffered to disk. A backup of a terabyte needs a tera
 
 Restore is the same picture backwards, with one rule added: a shard that fails its authentication tag stops the read.
 Nothing that failed authentication is ever handed to the decompressor.
-
-### Why tar‖xz and not .7z
-
-A `.7z` file cannot be written to a pipe. Its signature header at offset 0 contains `NextHeaderOffset`,
-`NextHeaderSize` and `NextHeaderCRC`, which are only known once the archive is complete – so the writer must seek back
-to byte 0. 7-Zip's own `-so` switch reflects this and supports only bzip2, gzip, tar and xz with the `a` command.
-
-Piping a tar through `7zz a -txz -si -so` uses the same LZMA2 codec at the same `-mx` levels, is inherently solid, and
-behaves identically on all five platforms. Building the tar in Go rather than letting an archiver do it also means
-entry names are exactly what [§7](#7-the-archive-namespace) decides, extraction is ordinary Go code whose rules are
-tested here, and the per-file digests fall out of the same pass.
-
-**One trap worth recording.** On an *extract* command with `-si`, a positional archive name is read as a filter
-selecting files *inside* the archive. `7zz e bond.xz -txz -si -so` therefore matches nothing, writes zero bytes, and
-exits 0 – a restore that reports success and produces an empty tree. The writer requires an archive name; the reader
-must not have one. See `internal/sevenzip/xz.go`.
-
----
 
 ## 2. Container layout
 
@@ -88,8 +64,6 @@ A copy that is damaged is *reported* even when it was not the one needed. That i
 spare copy is the rotten one opens on its first choice and looks perfectly healthy while being one flip from
 unopenable, and `bond repair` decides there is redundancy to restore by asking whether anything was reported. A region
 that stays quiet is a region that never gets healed.
-
----
 
 ## 3. Superblock
 
@@ -167,8 +141,6 @@ Two details force this ordering rather than a fallback at the point of failure:
 When a spare copy carries the day the reader records it, and `bond verify`, `bond inspect` and `bond repair` print it.
 The container opened, but it did so on its last copy of something, and the next flip is the one that loses it –
 `bond repair` writes the redundancy back.
-
----
 
 ## 4. Key model
 
@@ -274,8 +246,6 @@ Crockford's base32 alphabet omits I, L, O and U; the decoder accepts those anywa
 and hyphens are ignored wherever they fall; and a two-byte checksum catches what is left, so a mistyped key says so
 instead of quietly failing to open the backup.
 
----
-
 ## 5. Changing a key never touches the payload
 
 This is a design requirement, so the format is built for it rather than relying on care.
@@ -305,8 +275,6 @@ practice means a restore happened on a machine that is no longer trusted.
 
 `bond keys add|remove|rotate-passphrase` check the claim rather than making it: the payload region is hashed before
 and after, and a mismatch is reported as a bug rather than shrugged off.
-
----
 
 ## 6. Payload shards and recovery data
 
@@ -393,8 +361,6 @@ positions. Nothing is invented: the header carries its own MAC and the slot tabl
 key, so this restores redundancy the container already proved it owns. It is also the one repair that works without
 any recovery data at all, since it needs no parity to reconstruct anything.
 
----
-
 ## 6a. Volumes
 
 A container may be split across numbered files – `backup.bond.001`, `.002`, … – because an object store happy with a
@@ -447,8 +413,6 @@ every header copy of every volume in a set whose last file held less than 128 Ki
 shape: it is what a short final shard landing alone in its own volume looks like. The container was written, reported
 as written, and could then be opened by nothing.
 
----
-
 ## 7. The archive namespace
 
 Entry names are computed by BOND, per target:
@@ -493,8 +457,6 @@ being a UNC prefix – and converting it afterwards produced `/..`, which `path.
 absorbing the very component that made it an escape. The rule is applied on POSIX too. A container travels, and a
 target that escapes on one system is not something to restore faithfully on another.
 
----
-
 ## 8. Manifest
 
 gzip(JSON), sealed with `manifestKey` and framed as `[LE64 length][24-byte nonce][ciphertext]`, written twice.
@@ -511,8 +473,6 @@ when it was read. `storeFileIndex: false` turns it off.
 
 JSON and gzip rather than CBOR: no dependency, and a debuggable format for the one structure a future recovery effort
 would most want to read by hand.
-
----
 
 ## 9. What survives, what does not
 
@@ -626,8 +586,6 @@ Windows' 260-character limit is where backup tools quietly lose files. BOND has 
 own file access – and Go prefixes absolute paths with `\\?\` before calling the API. Tested both ways on Windows: a
 352-character source path and a 611-character one round-trip byte-identically, as does a 200-character file name.
 
----
-
 ## 10. Threat model
 
 **Protects against**
@@ -657,8 +615,6 @@ own file access – and Go prefixes absolute paths with `\\?\` before calling th
 **Leaked without a key**: the file size, the container UUID, the creation time, the shard geometry, the cipher and KDF
 parameters, and how many key slots of which kinds exist. Not the file names, not the sizes of individual files, not
 the source paths.
-
----
 
 ## 11. Recovering by hand
 
@@ -705,8 +661,6 @@ A backup format nobody can decode without its own tool is a single point of fail
 
 Steps 1–6 are about eighty lines of Go against `golang.org/x/crypto`, and the same in Python against `cryptography`
 and `argon2-cffi`.
-
----
 
 ## 12. Where the time goes
 

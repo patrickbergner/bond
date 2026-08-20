@@ -8,15 +8,6 @@ macOS or Linux.
 The destination is assumed hostile: it may read your backup without you knowing, it may quietly lose bytes,
 and it may still have the file long after you have forgotten it or the machine that wrote it is gone.
 
-## Getting it
-
-Take the archive for your platform from the [Releases](../../releases) page – `windows-amd64` or `windows-arm64`
-as a `.zip`, `linux-amd64`, `linux-arm64` or `macos-arm64` as a `.tar.gz` – and verify it against
-`SHA256SUMS.txt`. Each one unpacks to a single `bond-<version>/` directory holding the binary as plain `bond` or
-`bond.exe`, [config.sample.json](config.sample.json), a short `readme.txt`, `LICENSE` and the terms of the
-embedded 7-Zip. Nothing else is needed; there is no installer and no runtime to have. Run `bond selftest` once on
-the machine, and see [how it is built](#how-it-is-built) to make the same archives yourself.
-
 ## Who it is for
 
 - **One laptop and irreplaceable photos.** A control file naming the handful of directories that actually matter, a
@@ -227,8 +218,7 @@ drive happens to be current – so BOND refuses it rather than backing up someth
 ## How it is built
 
 ```
-./build.sh          # fetch embedded binaries, vet, test, then cross-compile all five platforms
-./dist/package.sh   # pack those five into the release archives, under dist/
+./build.sh   # fetch embedded binaries, vet, test, then cross-compile all five platforms
 ```
 
 Targets: `windows/amd64`, `windows/arm64`, `linux/amd64`, `linux/arm64`, `darwin/arm64`. The version they report
@@ -236,17 +226,6 @@ comes from [VERSION](VERSION).
 
 The embedded binaries are **not** committed. `tools/fetch` downloads a release pinned in
 [tools/manifest.json](tools/manifest.json). `go:embed` then builds each one into the binary for its platform.
-
-[dist/package.sh](dist/package.sh) produces exactly what a release publishes, so a package can be inspected before
-it is one. It asserts the layout of every archive it writes, and the archives are reproducible: the same commit
-packs to the same bytes. It needs a Linux host – GNU tar, `zip` and coreutils – which is where releases are built.
-
-It and [dist/readme.txt](dist/readme.txt), the plain-text readme that ships inside every package, are the two files
-in `dist/` that are checked in; everything else there is built and ignored.
-
-[.github/workflows/ci.yml](.github/workflows/ci.yml) runs gofmt, `build.sh`, the end-to-end suite and `package.sh`
-on every push and pull request, on Linux. [release.yml](.github/workflows/release.yml) does the same on a `v*` tag
-and publishes the archives, refusing before it builds anything if the tag and [VERSION](VERSION) disagree.
 
 ## How it is tested
 
