@@ -1,0 +1,74 @@
+{
+  "tools": {
+    "7-zip": {
+      "version": "26.02",
+      "binDir": "internal/sevenzip/bin",
+      "packages": {
+        "extra": {
+          "url": "https://www.7-zip.org/a/7z2602-extra.7z",
+          "sha256": "081df9e9311dfd9c9e0e98c1c80180b99bb51e4cb24156b5f3057fe3c259d70a"
+        },
+        "linux-arm64": {
+          "url": "https://www.7-zip.org/a/7z2602-linux-arm64.tar.xz",
+          "sha256": "70ea6cc737ae1495ea2d7eb20ef3120fe579bd3f1a83a9d2362b62ec5bde2bba"
+        },
+        "linux-x64": {
+          "url": "https://www.7-zip.org/a/7z2602-linux-x64.tar.xz",
+          "sha256": "41aaba7b1235304ab5aa0624530c67ae829496cd29e875925271efdccc28c03e"
+        },
+        "mac": {
+          "url": "https://www.7-zip.org/a/7z2602-mac.tar.xz",
+          "sha256": "1cf6760579502f87e591ff5c73a005ec50b3e4d6f507e8b038382d563c3175b9"
+        }
+      },
+      "binaries": [
+        {
+          "target": "windows/amd64",
+          "file": "7za-windows-amd64.exe",
+          "package": "extra",
+          "member": "x64/7za.exe",
+          "sha256": "35d4d69d7cd6cb44558f208c3b1334268013f9daf82d2dda848893a1c30c59c2",
+          "license": "License.txt",
+          "licenseSha256": "39d2187b942cc88818dd959e53c6b7dddd152097a42061467c4d56050168d646"
+        },
+        {
+          "target": "windows/arm64",
+          "file": "7za-windows-arm64.exe",
+          "package": "extra",
+          "member": "arm64/7za.exe",
+          "sha256": "cadbd34657713935222eb14fddbcdd51953501b44c749d9a029fab8f1c46be7e",
+          "license": "License.txt",
+          "licenseSha256": "39d2187b942cc88818dd959e53c6b7dddd152097a42061467c4d56050168d646"
+        },
+        {
+          "target": "linux/amd64",
+          "file": "7zz-linux-amd64",
+          "package": "linux-x64",
+          "member": "7zzs",
+          "sha256": "20df89e993594c1bb7686f125dabe1acc56c109fb1d9b40435ea5fcbc1ca3453",
+          "license": "License.txt",
+          "licenseSha256": "1790374e5352329cedb46ee3808930a88e9ca2f08b82b10fcf5cf605d2c301b1"
+        },
+        {
+          "target": "linux/arm64",
+          "file": "7zz-linux-arm64",
+          "package": "linux-arm64",
+          "member": "7zzs",
+          "sha256": "2f9b4ffcdc83eedb737a95bbdb04ab7f4805f8ad92aaef32ccc6b2bf32883209",
+          "license": "License.txt",
+          "licenseSha256": "1790374e5352329cedb46ee3808930a88e9ca2f08b82b10fcf5cf605d2c301b1"
+        },
+        {
+          "target": "darwin/arm64",
+          "file": "7zz-darwin-arm64",
+          "package": "mac",
+          "member": "7zz",
+          "machoSlice": "arm64",
+          "sha256": "e90bd9610567498bf419b82c4e589005d911225e940795f9c329397b2fb26465",
+          "license": "License.txt",
+          "licenseSha256": "1790374e5352329cedb46ee3808930a88e9ca2f08b82b10fcf5cf605d2c301b1"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,76 @@
+{
+    "$schema": "https://github.com/patrickbergner/bond/schema/bond-config.schema.json",
+    "targets": [
+        {
+            "id": "documents-windows",
+            "skip": true,
+            "sources": [ { "path": "C:\\Users\\alice\\Documents" } ]
+        },
+        {
+            "id": "documents-posix",
+            "skip": true,
+            "sources": [ { "path": "/home/alice/Documents" } ]
+        },
+        {
+            "id": "photos-windows",
+            "skip": true,
+            "sources": [
+                {
+                    "path": "C:\\Users\\alice\\Pictures",
+                    "includedPathPatterns": [ "^\\d{4}-\\d{2}-\\d{2}" ],
+                    "excludedPaths": [ "Thumbnails" ]
+                }
+            ]
+        },
+        {
+            "id": "photos-posix",
+            "skip": true,
+            "sources": [
+                {
+                    "path": "/home/alice/Pictures",
+                    "includedPathPatterns": [ "^\\d{4}-\\d{2}-\\d{2}" ],
+                    "excludedPaths": [ "Thumbnails" ]
+                }
+            ]
+        },
+        {
+            "id": "project-windows",
+            "skip": true,
+            "settings": { "compressionLevel": 0 },
+            "sources": [
+                {
+                    "path": "C:\\dev\\example-project",
+                    "includedPathPrefixes": [ "src", "docs" ],
+                    "excludedPathPrefixes": [ "src/generated" ],
+                    "excludedDirectoryNames": [ "node_modules", ".git" ],
+                    "excludedFileNames": [ "Thumbs.db" ]
+                }
+            ]
+        },
+        {
+            "id": "project-posix",
+            "skip": true,
+            "settings": { "compressionLevel": 0 },
+            "sources": [
+                {
+                    "path": "/home/alice/dev/example-project",
+                    "includedPathPrefixes": [ "src", "docs" ],
+                    "excludedPathPrefixes": [ "src/generated" ],
+                    "excludedDirectoryNames": [ "node_modules", ".git" ],
+                    "excludedFileNames": [ "Thumbs.db" ]
+                }
+            ]
+        }
+    ],
+    "settings": {
+        "compressionLevel": 5,
+        "encryptionMethod": "PROMPT_KEYPHRASE",
+        "keySlots": [
+            { "type": "keyfile", "path": "{{HOME}}/bond-recovery.key", "label": "offline copy" }
+        ],
+        "recoveryPercent": 10,
+        "hashAlgorithm": "SHA384",
+        "outputPath": "{{TOOL_DIR}}/output",
+        "workPath": "{{TOOL_DIR}}/work"
+    }
+}

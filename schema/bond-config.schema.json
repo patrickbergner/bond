@@ -1,0 +1,205 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/patrickbergner/bond/schema/bond-config.schema.json",
+  "title": "BOND control file",
+  "description": "Targets to back up and the settings that govern how each container is built.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["targets"],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Path or URL of this schema, for editor validation."
+    },
+    "targets": {
+      "type": "array",
+      "minItems": 1,
+      "description": "One container is produced per target that is not skipped.",
+      "items": { "$ref": "#/$defs/target" }
+    },
+    "settings": {
+      "$ref": "#/$defs/settings",
+      "description": "Defaults for every target."
+    }
+  },
+  "$defs": {
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "sources"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "description": "Unique name; also the container's file name stem."
+        },
+        "skip": {
+          "type": "boolean",
+          "default": false,
+          "description": "Leave this target out of a plain 'bond backup' run."
+        },
+        "sources": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/source" }
+        },
+        "settings": {
+          "$ref": "#/$defs/settings",
+          "description": "Overrides the global settings for this target only."
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path"],
+      "description": "A directory tree, plus the filters applied to it. Every filter matches the source-relative path with '/' separators; matching is case-insensitive on Windows.",
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Absolute path of the directory (or single file) to back up."
+        },
+        "includedPaths": {
+          "$ref": "#/$defs/stringList",
+          "description": "Literal source-relative paths to include. Naming a directory includes its whole subtree."
+        },
+        "excludedPaths": {
+          "$ref": "#/$defs/stringList",
+          "description": "Literal source-relative paths to exclude. Naming a directory excludes its whole subtree."
+        },
+        "includedPathPrefixes": {
+          "$ref": "#/$defs/stringList",
+          "description": "Include anything whose source-relative path starts with one of these strings."
+        },
+        "excludedPathPrefixes": {
+          "$ref": "#/$defs/stringList",
+          "description": "Exclude anything whose source-relative path starts with one of these strings."
+        },
+        "includedPathPatterns": {
+          "$ref": "#/$defs/stringList",
+          "description": "Include anything whose source-relative path matches one of these Go regular expressions."
+        },
+        "excludedPathPatterns": {
+          "$ref": "#/$defs/stringList",
+          "description": "Exclude anything whose source-relative path matches one of these Go regular expressions."
+        },
+        "excludedFileNames": {
+          "$ref": "#/$defs/nameList",
+          "description": "Exclude files with these names anywhere in the tree."
+        },
+        "excludedDirectoryNames": {
+          "$ref": "#/$defs/nameList",
+          "description": "Exclude directories with these names anywhere in the tree, along with everything inside them."
+        }
+      }
+    },
+    "settings": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "compressionLevel": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9,
+          "default": 5,
+          "description": "LZMA2 level handed to 7-Zip. 0 stores without compressing and skips 7-Zip entirely."
+        },
+        "encryptionMethod": {
+          "type": "string",
+          "enum": ["NONE", "PROMPT_KEYPHRASE", "KEYFILE", "RECIPIENT"],
+          "default": "PROMPT_KEYPHRASE",
+          "description": "The primary key slot. NONE stores the file master key in the container: integrity without confidentiality."
+        },
+        "keySlots": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/keySlot" },
+          "description": "Additional unlock methods, added alongside the primary one."
+        },
+        "recoveryPercent": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 50,
+          "default": 10,
+          "description": "Reed-Solomon parity as a percentage of the payload. 0 disables parity."
+        },
+        "shardBytes": {
+          "type": "integer",
+          "minimum": 65536,
+          "maximum": 268435456,
+          "multipleOf": 4096,
+          "default": 4194304,
+          "description": "Size of one shard, which is both the encryption block and the parity unit."
+        },
+        "maxVolumeBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Split the container into volumes of at most this size. 0 writes a single file."
+        },
+        "hashAlgorithm": {
+          "type": "string",
+          "enum": ["NONE", "SHA256", "SHA384", "SHA512"],
+          "default": "SHA384",
+          "description": "Sidecar checksum written next to the container, in sha*sum format."
+        },
+        "storeFileIndex": {
+          "type": "boolean",
+          "default": true,
+          "description": "Record the file list in the encrypted manifest, so 'bond list' needs no decompression."
+        },
+        "followSymlinks": {
+          "type": "boolean",
+          "default": false,
+          "description": "Store what a symlink points at instead of the link itself."
+        },
+        "outputPath": {
+          "type": "string",
+          "minLength": 1,
+          "default": "{{TOOL_DIR}}/output",
+          "description": "Where finished containers are placed."
+        },
+        "workPath": {
+          "type": "string",
+          "minLength": 1,
+          "default": "{{TOOL_DIR}}/work",
+          "description": "Where containers are assembled before being renamed into outputPath."
+        }
+      }
+    },
+    "keySlot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["passphrase", "keyfile", "recipient"],
+          "description": "passphrase is prompted for; keyfile reads 32 bytes from a file; recipient encapsulates to a public key."
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Key file location. Required for type 'keyfile'."
+        },
+        "publicKey": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Hybrid X25519 + ML-KEM-1024 public key. Required for type 'recipient'."
+        },
+        "label": {
+          "type": "string",
+          "description": "Free-text note shown by 'bond keys list'."
+        }
+      }
+    },
+    "stringList": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "nameList": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "pattern": "^[^/\\\\]+$" }
+    }
+  }
+}

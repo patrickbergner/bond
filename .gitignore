@@ -1,0 +1,16 @@
+# Built binaries
+/bond-*
+
+# Release packages. dist/package.sh and dist/readme.txt are sources and stay;
+# stage/ is where package.sh assembles each one, and a failed run leaves it.
+/dist/bond-*
+/dist/SHA256SUMS.txt
+/dist/stage/
+
+# Helper binaries, download cache, and licence texts fetched from upstream
+/internal/sevenzip/bin/
+/tools/download-cache/
+/tools/licenses/
+
+# Trees and containers built by testsuite/run.sh
+/testsuite/tmp/

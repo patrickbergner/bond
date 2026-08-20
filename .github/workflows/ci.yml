@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      # internal/sevenzip/bin/ is gitignored, so a fresh checkout cannot even
+      # compile: the go:embed of a per-platform 7-Zip is a build error, not a
+      # skipped test. The fetch pulls ~6.5 MB from www.7-zip.org; caching it
+      # keeps every push off a third-party host. Nothing installs unless it
+      # hashes to the value pinned in tools/manifest.json, so a poisoned cache
+      # fails the fetch rather than ending up inside the binary – and bumping
+      # the pinned 7-Zip changes the key.
+      - name: Cache the fetched binaries
+        uses: actions/cache@v6
+        with:
+          path: |
+            tools/download-cache
+            tools/licenses
+            internal/sevenzip/bin
+          key: sevenzip-${{ hashFiles('tools/manifest.json') }}
+
+      # build.sh runs this too, where it verifies rather than downloads. Doing
+      # it here first means a 7-zip.org outage is its own red step instead of
+      # something to find inside the build log.
+      - name: Fetch the embedded binaries
+        run: go run ./tools/fetch
+
+      # gofmt -l prints the offenders and still exits 0, so the gate has to be
+      # on its output.
+      - name: Format
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt would rewrite:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      # build.sh already runs the fetch, go vet ./... and go test ./... before
+      # cross-compiling, which is why there are no separate steps for them:
+      # splitting them out would run the test suite twice, and it moves a few
+      # hundred megabytes. CI runs the script a maintainer runs.
+      - name: Build
+        run: ./build.sh
+
+      # The part no package test can reach: the built binary, driven the way an
+      # operator drives it. Only the linux/amd64 one can be run here; the other
+      # four are cross-compiled, and `bond selftest` is their per-platform check
+      # on the machine that installs them.
+      - name: End-to-end suite
+        run: ./testsuite/run.sh
+
+      # Packaging is where a rename silently breaks a release, so it runs on
+      # every push rather than being exercised for the first time on a tag.
+      # package.sh asserts its own archive layouts.
+      - name: Package
+        run: ./dist/package.sh
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bond-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          compression-level: 0 # the payload is already-compressed archives
+          retention-days: 7

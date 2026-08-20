@@ -1,0 +1,275 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"time"
+
+	"github.com/patrickbergner/bond/internal/backup"
+	"github.com/patrickbergner/bond/internal/container"
+	"github.com/patrickbergner/bond/internal/crypto"
+	"github.com/patrickbergner/bond/internal/format"
+	"github.com/patrickbergner/bond/internal/ui"
+)
+
+func runVerify(args []string) error {
+	fs := newFlagSet("verify")
+	var (
+		quick bool
+		keys  keyFlags
+	)
+	fs.BoolVar(&quick, "quick", false, "")
+	keys.register(fs)
+	keys.registerShorthand(fs)
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, `usage: bond verify <container.bond>
+
+Checks a container for damage. Every shard is authenticated and the compressed
+stream is re-hashed against what the manifest recorded.
+
+options:
+      --quick   check only the checksum file next to the container.
+                Needs no key, so it is the check to run right after an upload
+                or a download.
+%s
+`, keyFlagHelp)
+	}
+	operands, err := parseFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(operands) != 1 {
+		return badUsage("verify needs exactly one container to check")
+	}
+	path := operands[0]
+
+	if quick {
+		return quickVerify(path)
+	}
+
+	r, err := openContainer(path, &keys)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+
+	sb := r.Superblock()
+	fmt.Printf("%s\n", path)
+	fmt.Printf("  header      %s\n", r.HeaderSource())
+	fmt.Printf("  shards      %s of %s\n", ui.Count(int(sb.DataShardCount)), ui.Bytes(int64(sb.ShardSize)))
+	fmt.Printf("  recovery    %s\n", sb.Plan())
+	for _, notice := range r.Notices() {
+		fmt.Printf("  repaired    %s\n", notice)
+	}
+
+	progress := ui.NewProgress(os.Stderr)
+	started := time.Now()
+	report, err := r.Verify(func(shard, total uint64) { progress.Add(int64(sb.ShardSize)) })
+	progress.Clear()
+	if err != nil {
+		return err
+	}
+
+	if report.Damaged() {
+		if len(report.DamagedShards) > 0 {
+			fmt.Printf("  damaged     %s: %v\n",
+				ui.Items(len(report.DamagedShards), "data shard", "data shards"), summarise(report.DamagedShards))
+		}
+		if len(report.DamagedParity) > 0 {
+			fmt.Printf("  damaged     %s\n", ui.Items(len(report.DamagedParity), "parity shard", "parity shards"))
+		}
+		switch {
+		case sb.Parity == format.ParityNone:
+			return fmt.Errorf("this container carries no recovery data, so the damage cannot be repaired; restore from another copy")
+		case report.Repairable:
+			fmt.Printf("  repairable  yes – run: bond repair %s\n", path)
+			return fmt.Errorf("the container is damaged but can be rebuilt from its recovery data")
+		default:
+			fmt.Printf("  repairable  no – %s lost more shards than the parity covers\n",
+				ui.Items(len(report.Unrepairable), "stripe", "stripes"))
+			return fmt.Errorf("the damage is beyond what this container's recovery data covers; restore from another copy")
+		}
+	}
+	if !report.StreamMatches {
+		return fmt.Errorf("every shard authenticates, but the compressed stream hashes to %s and the manifest says %s",
+			short(report.StreamSHA256), short(r.Manifest().StreamSHA256))
+	}
+
+	fmt.Printf("  checked     %s in %s\n", ui.Bytes(int64(sb.PayloadBytes())), time.Since(started).Round(time.Millisecond))
+	fmt.Printf("  OK          every shard authenticates and the stream matches its digest\n")
+	return nil
+}
+
+// quickVerify checks every volume of a container against its checksum file.
+//
+// The set is found by name rather than by reading any header, so this still
+// works on a container too damaged to open – which is the case it exists for.
+// A split set is checked file by file because that is how it is stored and
+// uploaded: one digest over the whole thing would name no volume when it failed.
+func quickVerify(path string) error {
+	volumes, err := volumeFiles(path)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("%s\n", path)
+	for _, p := range volumes {
+		algorithm, err := backup.CheckSidecar(p)
+		if err != nil {
+			return err
+		}
+		name := filepath.Base(p)
+		if len(volumes) == 1 {
+			name = "the container"
+		}
+		fmt.Printf("  %-24s %s matches its %s checksum file\n", name, ui.Bytes(fileSize(p)), algorithm)
+	}
+	return nil
+}
+
+// volumeFiles lists the files a container is stored in, without opening any of
+// them as a container.
+func volumeFiles(path string) ([]string, error) {
+	if _, err := os.Stat(path); err == nil {
+		if numbered, _ := filepath.Glob(container.VolumeBase(path) + ".[0-9][0-9][0-9]"); len(numbered) > 1 {
+			sort.Strings(numbered)
+			return numbered, nil
+		}
+		return []string{path}, nil
+	}
+	// A set written with splitting on is named .001 even when it needed only one
+	// file, so the name the operator knows it by may not exist on its own.
+	numbered, err := filepath.Glob(container.VolumeBase(path) + ".[0-9][0-9][0-9]")
+	if err != nil || len(numbered) == 0 {
+		return nil, fmt.Errorf("%s does not exist", path)
+	}
+	sort.Strings(numbered)
+	return numbered, nil
+}
+
+func runInspect(args []string) error {
+	fs := newFlagSet("inspect")
+	var keys keyFlags
+	keys.register(fs)
+	keys.registerShorthand(fs)
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, `usage: bond inspect <container.bond>
+
+Shows a container's format and settings. What can be read without a key is
+shown first and marked as unverified; the rest needs one.
+
+options:
+%s
+`, keyFlagHelp)
+	}
+	operands, err := parseFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(operands) != 1 {
+		return badUsage("inspect needs exactly one container to read")
+	}
+
+	r, err := container.Open(operands[0])
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+
+	sb := r.Superblock()
+	fmt.Printf("%s\n\n", operands[0])
+	fmt.Printf("without a key – read from the header, not yet authenticated\n")
+	fmt.Printf("  format            BOND %d.%d\n", sb.VersionMajor, sb.VersionMinor)
+	fmt.Printf("  container         %x\n", sb.ContainerUUID)
+	fmt.Printf("  created           %s\n", sb.Created.Format(time.RFC3339))
+	fmt.Printf("  cipher            %s\n", sb.Cipher)
+	fmt.Printf("  header copy       %s\n", r.HeaderSource())
+	fmt.Printf("  shard size        %s\n", ui.Bytes(int64(sb.ShardSize)))
+	fmt.Printf("  shards            %s\n", ui.Count(int(sb.DataShardCount)))
+	fmt.Printf("  payload           %s\n", ui.Bytes(int64(sb.PayloadBytes())))
+	fmt.Printf("  recovery data     %s\n", sb.Plan())
+	fmt.Printf("  volumes           %s\n", ui.Items(r.Volumes(), "file", "files"))
+
+	fmt.Printf("  key slots         %d\n", len(r.Slots()))
+	for _, s := range r.Slots() {
+		label := s.Label
+		if label != "" {
+			label = "  " + label
+		}
+		switch s.Type {
+		case crypto.SlotPassphrase:
+			fmt.Printf("    passphrase      argon2id, %s memory, %d passes, %d lanes%s\n",
+				ui.Bytes(int64(s.KDF.MemoryKiB)*1024), s.KDF.Iterations, s.KDF.Parallelism, label)
+		default:
+			fmt.Printf("    %-15s%s\n", s.Type, label)
+		}
+	}
+	if sb.Flags&format.FlagUnencrypted != 0 {
+		fmt.Printf("\n  encryption        NONE – the key is stored in this container.\n")
+		fmt.Printf("                    It is authenticated end to end, but anyone holding it can read it.\n")
+	}
+
+	secrets, err := keys.unlockersFor(r.Slots())
+	if err != nil {
+		fmt.Printf("\nwith a key\n  not shown: %v\n", err)
+		return nil
+	}
+	if err := r.Unlock(secrets...); err != nil {
+		return err
+	}
+
+	m := r.Manifest()
+	fmt.Printf("\nwith the key – authenticated\n")
+	for _, notice := range r.Notices() {
+		fmt.Printf("  damage            %s\n", notice)
+	}
+	if m.TargetID != "" {
+		fmt.Printf("  target            %s\n", m.TargetID)
+	}
+	fmt.Printf("  compression       %s", m.Compression.Format)
+	if m.Compression.Format != "none" {
+		fmt.Printf(", level %d", m.Compression.Level)
+	}
+	fmt.Println()
+	fmt.Printf("  contents          %s, %s, %s\n",
+		ui.Items(m.Files, "file", "files"), ui.Items(m.Dirs, "directory", "directories"), ui.Bytes(m.Bytes))
+	if m.Symlinks > 0 {
+		fmt.Printf("                    %s\n", ui.Items(m.Symlinks, "symlink", "symlinks"))
+	}
+	fmt.Printf("  compressed to     %s\n", ui.Bytes(m.StreamLength))
+	fmt.Printf("  file index        %s\n", indexState(m))
+	return nil
+}
+
+func indexState(m *format.Manifest) string {
+	if len(m.Index) == 0 {
+		return "not stored"
+	}
+	return fmt.Sprintf("%s recorded", ui.Items(len(m.Index), "entry", "entries"))
+}
+
+func fileSize(path string) int64 {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return info.Size()
+}
+
+func short(hash string) string {
+	if len(hash) > 16 {
+		return hash[:16] + "…"
+	}
+	return hash
+}
+
+// summarise keeps a long list of damaged shards readable.
+func summarise(shards []uint64) string {
+	const show = 8
+	if len(shards) <= show {
+		return fmt.Sprint(shards)
+	}
+	return fmt.Sprintf("%v and %d more", shards[:show], len(shards)-show)
+}
