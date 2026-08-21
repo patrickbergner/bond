@@ -343,3 +343,32 @@ func TestTooManyLanesIsRefusedRatherThanClamped(t *testing.T) {
 		t.Errorf("255 lanes should be allowed: %v", err)
 	}
 }
+
+func TestKDFPolicyBoundsUnauthenticatedWork(t *testing.T) {
+	accepted := []KDFParams{
+		DefaultKDF,
+		{MemoryKiB: 1024 * 1024, Iterations: 3, Parallelism: 8},
+		{MemoryKiB: 512 * 1024, Iterations: 6, Parallelism: 64},
+	}
+	for _, params := range accepted {
+		if err := params.Check(DefaultKDFPolicy); err != nil {
+			t.Errorf("default policy rejected %+v: %v", params, err)
+		}
+	}
+	rejected := []KDFParams{
+		{MemoryKiB: 1024*1024 + 1, Iterations: 1, Parallelism: 1},
+		{MemoryKiB: 8 * 1024, Iterations: 7, Parallelism: 1},
+		{MemoryKiB: 8 * 1024, Iterations: 1, Parallelism: 65},
+		{MemoryKiB: 1024 * 1024, Iterations: 4, Parallelism: 1},
+	}
+	for _, params := range rejected {
+		if err := params.Check(DefaultKDFPolicy); !errors.Is(err, ErrKDFPolicy) {
+			t.Errorf("default policy accepted %+v: %v", params, err)
+		}
+		unlimited := DefaultKDFPolicy
+		unlimited.AllowExpensive = true
+		if err := params.Check(unlimited); err != nil {
+			t.Errorf("explicit override rejected format-valid %+v: %v", params, err)
+		}
+	}
+}

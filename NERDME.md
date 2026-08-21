@@ -99,6 +99,8 @@ that stays quiet is a region that never gets healed.
 | 240 | 4 | On-disk size of the final shard |
 | 244 | 3852 | Reserved, zero |
 
+Format 1.0 means exactly major 1, minor 0. Other versions and unknown flag bits are refused.
+
 The **header MAC** is `HMAC-SHA256(headerKey, superblock with bytes 208–239 zeroed)` and covers all 4096 bytes,
 reserved area included, so nothing can be smuggled into the padding.
 
@@ -106,8 +108,8 @@ reserved area included, so nothing can be smuggled into the padding.
 difference is the whole of what that sentence promises. Marshalling a parsed header back out writes zeros across the
 reserved region, so a MAC computed that way never looks at what is really stored there – which left 3852 bytes per
 header copy that anyone could write to, on a container that would then pass `bond verify` reporting no damage at all.
-Reading the MAC over the raw bytes also means a later minor version can put a field in that region and an older build
-still authenticates the header; it simply does not know what the field means.
+Reading the MAC over the raw bytes means corruption or unauthorized data in the reserved region is still detected.
+A future format must use a new declared version and is refused by this 1.0 reader rather than guessed at.
 
 The honest limit: this stops anyone *without* the header key. A key holder can put whatever they like in the padding
 and sign it, and no reader can tell.
@@ -176,8 +178,17 @@ could in principle be crafted to open differently under two different secrets. T
 anything else is trusted.
 
 **`encryptionMethod: NONE`** is not a separate code path. BOND still generates an FMK, still seals every shard, and
-stores the FMK wrapped under an all-zero key-encryption key in a `plaintext` slot. The container is authenticated end
-to end; anyone holding it can read it. `bond inspect` says so in those words.
+stores the FMK wrapped under an all-zero key-encryption key in a `plaintext` slot. The tags provide corruption
+detection, not adversarial authenticity: anyone holding the container can read it, recover the FMK and create modified
+content with valid tags. An external signature is required when malicious-tamper evidence matters.
+
+`FlagUnencrypted` in the header is advisory, and `bond keys remove` refuses to delete a plaintext slot. Neither is
+fussiness. The flag records what was true when the container was written and no key change may rewrite it – the
+superblock does not authenticate the slot tables, and re-signing every volume header on every key change is exactly the
+cost that design avoids. So flag and slots can disagree, readers must tolerate it, and anything telling an operator
+whether a container is readable asks the *slots*. Removing the plaintext slot, meanwhile, looks like "encrypt this
+backup now" and is not: the master key was stored in the file when it was written, and everyone who took a copy before
+today still has it. `bond rekey` is the operation that changes who can read a backup.
 
 ### Key-slot table
 
@@ -209,6 +220,21 @@ Each record:
 | 80 | 48 | The sealed master key |
 | 128 | 2 + n | Label length and UTF-8 label |
 | … | 4 + m | Key-exchange length and bytes – recipient slots only, otherwise 0 |
+
+Both 64 KiB tables are authenticated as the exact bytes read, including unused padding. Before Argon2 runs, a reader
+also applies a local hostile-input policy: at most 1 GiB memory, 6 passes, 64 lanes and 3 GiB-passes for one derivation,
+and at most 64 derivations per unlock. Equivalent header/table attempts are deduplicated, so the four header-copy ×
+slot-table combinations cost one derivation rather than four, and a refused passphrase slot does not prevent a safe
+key-file, plaintext or recipient slot from being tried. `--allow-expensive-kdf` bypasses these local willingness limits
+but retains permanent format validity checks and emits a resource-risk warning.
+
+The second limit counts derivations rather than their total cost, and that is deliberate. A cumulative *work* ceiling
+is either above `maxSlots × 3 GiB-passes`, in which case the per-derivation cap already enforces it, or below – in which
+case it refuses containers BOND itself wrote. The version that shipped with the limit at 6 GiB-passes allowed exactly
+four derivations at the default profile, so a container with five passphrase slots failed to open unless the right one
+came up early, reporting that its own default parameters exceeded the safety policy. What bounds the hostile case is
+the memory ceiling on any single derivation; what bounds the total is that a table declares at most `maxSlots` slots
+and the derivations run one after another, never concurrently.
 
 The slot's associated data is `"BOND-SLOT-V1" ‖ containerUUID ‖ slotUUID ‖ slotType ‖ salt ‖ kdfParams`, with the key
 exchange in place of the KDF parameters for a recipient slot. Binding the cost parameters matters: without it, an
@@ -254,13 +280,15 @@ The superblock **does not authenticate the slot tables**. If it did, adding a ke
 and in a split container, the superblock in every volume. Instead each table carries its own MAC and its own
 generation counter, and the two tables alternate:
 
-1. Unlock the master key with an existing slot.
-2. Build the new slot set and write it into the **inactive** table with `generation + 1`.
-3. fsync.
+1. Unlock the master key and authenticate both header copies and both slot tables.
+2. Select the highest authentic generation. Equal-generation authentic tables must be byte-identical, and the maximum
+   generation cannot be incremented.
+3. Build the new slot set and write only the selected table's physical peer with `generation + 1`.
+4. fsync, re-read, parse and authenticate the new table before reporting success.
 
-A crash between steps leaves the previous table untouched and still the highest valid generation, so the operation is
-atomic without a journal. Readers try the newest table that parses and fall back to the other if it fails to
-authenticate. Total I/O for a key change on a terabyte container: 64 KiB.
+A crash between steps leaves the previous authentic table untouched. If only one authentic copy remains, it is
+preserved and the damaged peer is the one rewritten. Readers try authentic tables by generation. Total I/O for a key
+change on a terabyte container: 64 KiB.
 
 That fallback is availability, not a weakening of `bond keys remove`. Rolling a container back to an older slot set is
 already open to anyone who can write to the file – destroy the newer table's magic and the older one is picked, and it
@@ -382,21 +410,9 @@ reader that never has to stitch a shard together across two of them.
 are. `bond restore backup.bond.003` finds the rest – which matters, because the file to hand during a recovery is
 rarely the first one.
 
-The mirror used to close only the last volume, and that was a hole worth naming. Every entry point re-reads volume 1 to
-learn the shape of the set, so a single flipped bit in volume 1's header made the whole container unopenable from any
-of its files, with no second opinion anywhere to fall back on. Four kilobytes per file buys back the rule the rest of
-the format keeps.
-
-Writing the spare is only half of it. The checks that run *before* a key exists – that each file is the volume it
-claims to be, and that the volumes describe one unbroken payload – used to be decided against whichever copy happened
-to parse first. A mirror is no use if the reader has already refused the container on the strength of the damaged copy,
-so those checks now accept any copy that agrees, and the contiguity check is deferred to after unlock whenever a second
-copy still exists. It runs again there, on numbers a key has vouched for.
-
-A container written before every volume carried a mirror is read exactly as it was. The reader tells the two apart by
-whether there is room between the end of a volume's payload and the end of the file, rather than by a version number –
-which is also what stops `bond repair` writing a mirrored header over the last shard of a middle volume that never had
-room for one.
+A fully missing mirror is reported as degraded metadata on the first, middle or last volume and `bond repair` restores
+it. A partial mirror is truncation, not a legacy layout. Strict writer readback requires both authenticated copies on
+every newly written volume before and after publication.
 
 Three things are checked before a split container is trusted, in increasing order of strength: the volumes must be
 numbered as they claim; they must all carry the same container UUID, since two containers of the same shape otherwise
@@ -412,6 +428,26 @@ records the same value. A reader that insisted it point past the whole 132 KiB h
 every header copy of every volume in a set whose last file held less than 128 KiB of payload. That is an ordinary
 shape: it is what a short final shard landing alone in its own volume looks like. The container was written, reported
 as written, and could then be opened by nothing.
+
+Publication is no-clobber and uses atomic no-replace moves on one filesystem. The destination namespace (base,
+numbered volumes and checksum sidecars) must be empty before writing begins and is checked again at commit time.
+Volumes `.002` and later move first, the destination directory is synced, and `.001` moves last as the commit point,
+followed by another directory sync. A reported failure triggers reverse rollback where possible. A process crash can
+leave non-leading orphan volumes, which do not form a valid set and require explicit operator cleanup; BOND never
+deletes or replaces an existing backup set automatically. The refusal names every file occupying the namespace, because
+"something is in the way" is not something an operator can act on. Sidecars use exclusive creation.
+
+What counts as the namespace is the same rule `VolumeFiles` uses to discover a set, not "ends in three digits":
+`backup.bond.old.001` is a volume of `backup.bond.old` and does not block `backup.bond`. The writer's own staging files
+are exempt from the commit-time recheck, which matters when `workPath` and `outputPath` name one directory – the
+same-filesystem requirement makes that a natural thing to configure, and `backup.bond.partial.001` would otherwise look
+like a competitor to the container it is about to become.
+
+The no-replace move is `renameat2(RENAME_NOREPLACE)` on Linux and `renamex_np(RENAME_EXCL)` on macOS, falling back to
+`link` + `unlink` where the filesystem does not implement them – NFS, several FUSE backends and pre-3.15 kernels return
+`EINVAL`, `ENOSYS` or `EOPNOTSUPP`. `link` fails with `EEXIST` if the destination exists, which is the same guarantee,
+and those are exactly the destinations an archival tool gets pointed at. Windows uses `MoveFileEx` without
+`MOVEFILE_REPLACE_EXISTING`, which refuses an occupied target by default.
 
 ## 7. The archive namespace
 
@@ -438,24 +474,32 @@ A restore reads names written somewhere else, possibly years ago, possibly by so
 the destination. `internal/archive/safepath.go` refuses, before a single byte is written: empty names, NUL bytes,
 absolute paths, UNC paths, drive letters, `.` and `..` components, and – on Windows only – backslashes, `:*?"<>|`,
 names ending in a space or dot, and the reserved device names (`CON`, `NUL`, `COM1`…). Entry types BOND's own writer
-never produces – hard links, devices, fifos – are refused as well: meeting one means the stream is not what it claims
+never produces – symlinks, hard links, devices, fifos – are refused as well: meeting one means the stream is not what it claims
 to be.
+
+Half of that list is a *restore* policy rather than a format rule, and the two must not be confused. `com1`, `a:b`,
+`back\slash` and `trailing.` are ordinary file names on Linux and unusable on Windows, so a container can legitimately
+contain them and a Windows restore must legitimately refuse them – one entry at a time, by name, at the moment it would
+be created. Nothing that decides whether a container *opens* may apply them. `Manifest.Validate` checks its index with
+`CheckPortableName`, the platform-independent half; using the full `CheckName` there made a backup written on Linux
+fail to unlock on Windows, so `inspect`, `verify`, `list` and even a `--include` restore of untouched paths all reported
+the manifest as invalid. A container that authenticates completely is not invalid because of where it is being read.
 
 The name is judged **before** the include filter is consulted, so "it would have been skipped anyway" is never the
 reason a hostile archive is accepted. An offending entry **aborts the whole restore** rather than being skipped. An
 archive containing a path that tries to escape is not a backup with one bad entry; it is a backup that cannot be
 trusted.
 
-**Symlink targets are checked lexically** against the destination, never resolved through the filesystem – an attacker
-who chooses both a link and its target can otherwise walk a restore out of its directory one component at a time, and
-what resolution finds depends on whatever happens to exist at restore time. Symlinks are off by default.
+Archive entry names are confined **lexically** below the selected destination. Existing symlinks, junctions, reparse
+points and other filesystem redirections below that destination retain normal operating-system behavior and are the
+operator's responsibility. Restore into a new or suitably prepared directory when following existing redirections is
+not desired. The archive itself cannot introduce a new redirection because every link entry is rejected.
 
-The lexical check normalises backslashes to separators *before* deciding anything, on every platform, and that ordering
-is the whole point. `FuzzCheckLink` found the version that did it the other way round: a target of `\..` is not caught
-by the absolute-path test, because on Windows a *single* leading backslash is rooted at the current drive rather than
-being a UNC prefix – and converting it afterwards produced `/..`, which `path.Join` then cleaned to `/`, quietly
-absorbing the very component that made it an escape. The rule is applied on POSIX too. A container travels, and a
-target that escapes on one system is not something to restore faithfully on another.
+At backup time `followSymlinks` defaults to true. A link target is materialized as an ordinary file or directory tree
+at the link's archive path, even when the target is outside the lexical source root. Directory identity is tracked only
+along the current recursion ancestry: a loop edge is omitted with a warning, while repeated non-cyclic aliases are
+materialized independently. With following disabled, included links are omitted, counted and reported. Filters apply
+to the link's archive path and the resolved target kind.
 
 ## 8. Manifest
 
@@ -543,7 +587,7 @@ Named cases, each its own test:
 
 ### Fuzzing
 
-Seven targets, run as ordinary tests over their seed corpus on every `go test` and extended with `-fuzz`:
+Six targets, run as ordinary tests over their seed corpus on every `go test` and extended with `-fuzz`:
 
 | Target | What it asserts |
 |---|---|
@@ -551,13 +595,10 @@ Seven targets, run as ordinary tests over their seed corpus on every `go test` a
 | `FuzzParseSlotTable` | A table that parses has slots of the declared sizes |
 | `FuzzOpenManifest` | The unauthenticated length field cannot become an absurd allocation |
 | `FuzzSafeJoin` | If a name is accepted, the path is clean and inside the destination |
-| `FuzzCheckLink` | If a link is accepted, following it stays inside the destination |
 | `FuzzDecodeRecoveryKey` | An accepted key is exactly 32 bytes |
 | `FuzzRecoveryKeySurvivesRetyping` | Any case, hyphenation or confusable substitution decodes to the same seed |
 
-About 64 million executions so far, one real bug: the symlink normalisation ordering in
-[§7](#extraction-policy). Its failing input is committed under `internal/archive/testdata/fuzz/` and runs as a
-regression case forever.
+The committed seed corpora run as regression cases on every ordinary test invocation.
 
 The header and slot-table targets patch a *valid* structure at a fuzzer-chosen offset rather than taking raw bytes.
 Random bytes essentially never survive a magic number, so a blind target spends its whole budget on the first four
@@ -592,8 +633,8 @@ own file access – and Go prefixes absolute paths with `\\?\` before calling th
 
 - A cloud operator reading the backup. Everything but the header geometry is sealed.
 - Bit rot and range corruption: every shard is authenticated, and damage is located to the shard.
-- A container altered in transit: the header MAC, the slot table MAC, the per-shard tags, the manifest tag and the
-  key commitment all have to agree.
+- An encrypted container altered in transit: the header MAC, slot-table MAC, per-shard tags, manifest tag and key
+  commitment all have to agree for an attacker who does not possess an unlocking secret.
 - A shard moved, duplicated or transplanted from another container.
 - A wrong passphrase: rejected before any payload is touched.
 - A half-written backup: the container is built in the working directory and renamed into place only when complete.
@@ -607,6 +648,8 @@ own file access – and Go prefixes absolute paths with `\\?\` before calling th
 - Traffic analysis of size and timing. The container's size is not hidden.
 - Damage beyond the recovery capacity of a stripe. Parity repairs corruption, not deletion, and not more losses than
   it covers.
+- Malicious modification of a `NONE` container. Its key is stored in the container, so its tags provide corruption
+  detection but no provenance or adversarial authenticity; use an external signature where that property is needed.
 - **Rolling the key slots back.** Someone who can write to the container can destroy the newer slot table and leave
   the older one, which is authentic because it was. A key removed with `bond keys remove` therefore stops working for
   anyone who has only the container; it is not proof against someone who kept a copy of the file. `bond rekey` is the

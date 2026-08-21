@@ -92,6 +92,9 @@ func Create(ctx context.Context, opts CreateOptions) (*CreateResult, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := container.ValidatePublication(opts.WorkDir, opts.OutputPath); err != nil {
+		return nil, err
+	}
 
 	work := filepath.Join(opts.WorkDir, filepath.Base(opts.OutputPath)+".partial")
 	w, err := container.Create(work, container.Options{
@@ -104,6 +107,7 @@ func Create(ctx context.Context, opts CreateOptions) (*CreateResult, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer w.Destroy()
 	// Anything that goes wrong from here leaves no trace: the partial file is
 	// removed and the destination is never touched.
 	finished := false
@@ -137,19 +141,20 @@ func Create(ctx context.Context, opts CreateOptions) (*CreateResult, error) {
 	walker := &source.Walker{
 		FollowSymlinks: opts.Settings.FollowSymlinks,
 		OnProblem:      opts.OnProblem,
+		OnWarning:      opts.OnWarning,
 	}
 	stats, err := walker.Walk(specs, func(e source.Entry) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		entry := archive.Entry{
-			Path:    e.Archive,
-			Disk:    e.Abs,
-			Kind:    archiveKind(e.Kind),
-			Size:    e.Size,
-			Mode:    e.Mode,
-			ModTime: e.ModTime,
-			Link:    e.Link,
+			Path:     e.Archive,
+			Disk:     e.Abs,
+			Kind:     archiveKind(e.Kind),
+			Size:     e.Size,
+			Mode:     e.Mode,
+			ModTime:  e.ModTime,
+			Expected: e.Expected,
 		}
 		if opts.OnEntry != nil {
 			opts.OnEntry(entry)
@@ -173,11 +178,17 @@ func Create(ctx context.Context, opts CreateOptions) (*CreateResult, error) {
 	if err := w.Finish(m); err != nil {
 		return nil, fmt.Errorf("completing the container: %w", err)
 	}
+	if err := w.Validate(work); err != nil {
+		return nil, fmt.Errorf("the completed staging container fails authenticated readback: %w", err)
+	}
 	paths, err := w.Publish(opts.OutputPath)
 	if err != nil {
 		return nil, fmt.Errorf("publishing the container: %w", err)
 	}
 	finished = true
+	if err := w.Validate(paths[0]); err != nil {
+		return nil, fmt.Errorf("the published container fails authenticated readback: %w", err)
+	}
 
 	// The published file stays where it is if this fails. It may be the only
 	// copy of the data, and deleting it on the strength of a self-check would
@@ -237,9 +248,9 @@ func Create(ctx context.Context, opts CreateOptions) (*CreateResult, error) {
 // because doubling the I/O of every backup to re-check bytes that were sealed a
 // moment ago is what "bond verify" is for.
 //
-// A recipient-only container has no secret on this machine by design, so there
-// it goes as far as opening and stops, which still exercises everything the
-// header and volume set have to get right.
+// Recipient-only containers have already passed Writer.Validate with their
+// generated keys. They cannot prove the printed private recovery key on this
+// machine; that remains the purpose of a restore drill.
 func confirmReadable(path string, keys []container.KeySpec) error {
 	r, err := container.Open(path)
 	if err != nil {
@@ -303,8 +314,6 @@ func archiveKind(k source.Kind) archive.Kind {
 	switch k {
 	case source.KindDir:
 		return archive.KindDir
-	case source.KindSymlink:
-		return archive.KindSymlink
 	default:
 		return archive.KindFile
 	}
@@ -312,15 +321,13 @@ func archiveKind(k source.Kind) archive.Kind {
 
 func buildManifest(opts CreateOptions, layout *source.Layout, stats source.Stats, tw *archive.Writer) *format.Manifest {
 	m := &format.Manifest{
-		TargetID:       opts.Target.ID,
-		Tool:           "bond",
-		ArchiveRoot:    layout.Root,
-		SyntheticRoots: layout.Synthetic,
-		FollowSymlinks: opts.Settings.FollowSymlinks,
-		Files:          stats.Files,
-		Dirs:           stats.Dirs,
-		Symlinks:       stats.Symlinks,
-		Bytes:          stats.Bytes,
+		TargetID:        opts.Target.ID,
+		Tool:            "bond",
+		ArchiveRoot:     layout.Root,
+		SyntheticRoots:  layout.Synthetic,
+		FollowSymlinks:  opts.Settings.FollowSymlinks,
+		SkippedSymlinks: stats.SkippedSymlinks,
+		IndexStored:     opts.Settings.StoreFileIndex,
 		Compression: format.Compression{
 			Format: "none",
 			Level:  opts.Settings.CompressionLevel,
@@ -332,6 +339,15 @@ func buildManifest(opts CreateOptions, layout *source.Layout, stats source.Stats
 	}
 	if opts.Settings.StoreFileIndex {
 		m.Index = tw.Index()
+	}
+	for _, entry := range tw.Index() {
+		switch entry.Kind {
+		case archive.KindDir:
+			m.Dirs++
+		default:
+			m.Files++
+			m.Bytes += entry.Size
+		}
 	}
 	return m
 }
@@ -366,7 +382,19 @@ func WriteSidecar(path, algorithm string) (string, error) {
 
 	sidecar := path + ext
 	line := fmt.Sprintf("%s  %s\n", hex.EncodeToString(h.Sum(nil)), filepath.Base(path))
-	if err := os.WriteFile(sidecar, []byte(line), 0o644); err != nil {
+	fout, err := os.OpenFile(sidecar, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return "", err
+	}
+	if _, err := io.WriteString(fout, line); err != nil {
+		fout.Close()
+		return "", err
+	}
+	if err := fout.Sync(); err != nil {
+		fout.Close()
+		return "", err
+	}
+	if err := fout.Close(); err != nil {
 		return "", err
 	}
 	return sidecar, nil

@@ -44,6 +44,7 @@ type SlotTable struct {
 	Generation uint64
 	Slots      []*crypto.Slot
 	MAC        []byte
+	raw        []byte
 }
 
 // Marshal renders the table into exactly SlotTableSize bytes. The MAC is left
@@ -107,6 +108,7 @@ func ParseSlotTable(b []byte) (*SlotTable, error) {
 	t := &SlotTable{
 		Generation: binary.LittleEndian.Uint64(b[offSlotGeneration:]),
 		MAC:        append([]byte(nil), b[offSlotMAC:offSlotMAC+32]...),
+		raw:        append([]byte(nil), b[:SlotTableSize]...),
 	}
 
 	rest := b[offSlotRecords : offSlotRecords+used]
@@ -124,10 +126,17 @@ func ParseSlotTable(b []byte) (*SlotTable, error) {
 // Verify checks the table's MAC, which is possible only once a key has been
 // recovered from one of its slots.
 func (t *SlotTable) Verify(headerKey []byte) error {
-	unsigned := &SlotTable{Generation: t.Generation, Slots: t.Slots}
-	b, err := unsigned.Marshal(nil)
-	if err != nil {
-		return err
+	var b []byte
+	if len(t.raw) == SlotTableSize {
+		b = append([]byte(nil), t.raw...)
+		clear(b[offSlotMAC : offSlotMAC+32])
+	} else {
+		unsigned := &SlotTable{Generation: t.Generation, Slots: t.Slots}
+		var err error
+		b, err = unsigned.Marshal(nil)
+		if err != nil {
+			return err
+		}
 	}
 	if !crypto.CheckMAC(headerKey, b, t.MAC) {
 		return errors.New("the key-slot table fails authentication; it has been damaged or altered")

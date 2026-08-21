@@ -250,24 +250,15 @@ func TestWalkSymlinks(t *testing.T) {
 		t.Skipf("symlinks are not available here: %v", err)
 	}
 
-	entries, stats := walk(t, config.Source{Path: root}, nil)
-	var found *Entry
+	var warnings int
+	entries, stats := walk(t, config.Source{Path: root}, &Walker{OnWarning: func(string, string) { warnings++ }})
 	for i := range entries {
 		if entries[i].Archive == "tools/link.md" {
-			found = &entries[i]
+			t.Fatal("a symlink entry was emitted when followSymlinks is off")
 		}
 	}
-	if found == nil {
-		t.Fatal("the symlink was not walked")
-	}
-	if found.Kind != KindSymlink {
-		t.Errorf("Kind = %v, want a symlink when followSymlinks is off", found.Kind)
-	}
-	if found.Link == "" {
-		t.Error("the link target was not recorded")
-	}
-	if stats.Symlinks != 1 {
-		t.Errorf("Symlinks = %d, want 1", stats.Symlinks)
+	if stats.SkippedSymlinks != 1 || warnings != 1 {
+		t.Errorf("skipped symlinks = %d, warnings = %d; want one of each", stats.SkippedSymlinks, warnings)
 	}
 
 	entries, _ = walk(t, config.Source{Path: root}, &Walker{FollowSymlinks: true})
@@ -288,8 +279,147 @@ func TestWalkFollowedSymlinkLoopTerminates(t *testing.T) {
 	if err := os.Symlink(root, filepath.Join(root, "loop")); err != nil {
 		t.Skipf("symlinks are not available here: %v", err)
 	}
-	if _, err := walkNoFatal(t, config.Source{Path: root}, &Walker{FollowSymlinks: true}); err != nil {
+	warnings := 0
+	w := &Walker{FollowSymlinks: true, OnWarning: func(string, string) { warnings++ }}
+	stats, err := walkNoFatal(t, config.Source{Path: root}, w)
+	if err != nil {
 		t.Fatalf("Walk: %v", err)
+	}
+	if stats.SkippedSymlinks != 1 || warnings != 1 {
+		t.Fatalf("loop cutoff: stats=%+v warnings=%d", stats, warnings)
+	}
+}
+
+func TestWalkFollowedSelfSymlinkIsCutOff(t *testing.T) {
+	root := t.TempDir()
+	self := filepath.Join(root, "self")
+	if err := os.Symlink("self", self); err != nil {
+		t.Skipf("symlinks are not available here: %v", err)
+	}
+	warnings := 0
+	entries, stats := walk(t, config.Source{Path: root}, &Walker{
+		FollowSymlinks: true,
+		OnWarning:      func(string, string) { warnings++ },
+	})
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Archive, "/self") {
+			t.Fatalf("self loop emitted archive entry %+v", entry)
+		}
+	}
+	if stats.SkippedSymlinks != 1 || warnings != 1 {
+		t.Fatalf("self-loop stats=%+v warnings=%d", stats, warnings)
+	}
+}
+
+func TestFollowedDirectoryTargetOutsideSourceRoot(t *testing.T) {
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "outside.txt"), []byte("included"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(root, "external")); err != nil {
+		t.Skipf("symlinks are not available here: %v", err)
+	}
+	entries, _ := walk(t, config.Source{Path: root}, &Walker{FollowSymlinks: true})
+	want := filepath.Base(root) + "/external/outside.txt"
+	for _, entry := range entries {
+		if entry.Archive == want && entry.Kind == KindFile {
+			return
+		}
+	}
+	t.Fatalf("outside-root target was not materialized at %q: %+v", want, entries)
+}
+
+func TestFollowedDirectoryAliasesAreMaterializedIndependently(t *testing.T) {
+	root := t.TempDir()
+	real := filepath.Join(root, "real")
+	if err := os.Mkdir(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(real, "content.txt"), []byte("same"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"alias-a", "alias-b"} {
+		if err := os.Symlink(real, filepath.Join(root, name)); err != nil {
+			t.Skipf("symlinks are not available here: %v", err)
+		}
+	}
+	entries, _ := walk(t, config.Source{Path: root}, &Walker{FollowSymlinks: true})
+	want := map[string]bool{
+		filepath.Base(root) + "/real/content.txt":    false,
+		filepath.Base(root) + "/alias-a/content.txt": false,
+		filepath.Base(root) + "/alias-b/content.txt": false,
+	}
+	for _, entry := range entries {
+		if _, ok := want[entry.Archive]; ok {
+			want[entry.Archive] = true
+		}
+	}
+	for path, found := range want {
+		if !found {
+			t.Errorf("materialized path %q is missing", path)
+		}
+	}
+}
+
+func TestSourceRootSymlinkUsesTheSamePolicy(t *testing.T) {
+	targetDir := t.TempDir()
+	target := filepath.Join(targetDir, "target.txt")
+	if err := os.WriteFile(target, []byte("root link"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "source-link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks are not available here: %v", err)
+	}
+	entries, stats := walk(t, config.Source{Path: link}, &Walker{FollowSymlinks: true})
+	if len(entries) != 1 || entries[0].Kind != KindFile || entries[0].Size != int64(len("root link")) {
+		t.Fatalf("followed root link = %+v", entries)
+	}
+	if stats.Files != 1 || stats.SkippedSymlinks != 0 {
+		t.Fatalf("followed root stats = %+v", stats)
+	}
+	entries, stats = walk(t, config.Source{Path: link}, &Walker{})
+	if len(entries) != 0 || stats.SkippedSymlinks != 1 {
+		t.Fatalf("skipped root link entries=%+v stats=%+v", entries, stats)
+	}
+}
+
+func TestSymlinkFiltersUseArchivePathAndResolvedKind(t *testing.T) {
+	root := t.TempDir()
+	realDir := filepath.Join(root, "real-dir")
+	if err := os.Mkdir(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(realDir, "inside.txt"), []byte("inside"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realDir, filepath.Join(root, "excluded-alias")); err != nil {
+		t.Skipf("symlinks are not available here: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(root, "missing"), filepath.Join(root, "excluded-dangling")); err != nil {
+		t.Skipf("symlinks are not available here: %v", err)
+	}
+
+	sourceSpec := config.Source{
+		Path:                   root,
+		ExcludedDirectoryNames: []string{"excluded-alias"},
+		ExcludedFileNames:      []string{"excluded-dangling"},
+	}
+	for _, follow := range []bool{false, true} {
+		warnings := 0
+		entries, stats := walk(t, sourceSpec, &Walker{
+			FollowSymlinks: follow,
+			OnWarning:      func(string, string) { warnings++ },
+		})
+		for _, entry := range entries {
+			if strings.Contains(entry.Archive, "excluded-") {
+				t.Errorf("follow=%v emitted filtered link path %q", follow, entry.Archive)
+			}
+		}
+		if warnings != 0 || stats.SkippedSymlinks != 0 || stats.ExcludedDirs != 1 || stats.ExcludedFiles != 1 {
+			t.Errorf("follow=%v stats=%+v warnings=%d; filtered links should be ordinary exclusions", follow, stats, warnings)
+		}
 	}
 }
 

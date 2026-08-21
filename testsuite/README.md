@@ -44,7 +44,7 @@ root, and refuses to start if it is not there.
 | `80-damage-and-repair` | damage found, located, rebuilt, or refused out loud |
 | `90-split-volumes` | a set of numbered files: moved, damaged, missing, mismatched, repaired |
 | `91-awkward-trees` | empty files, umlauts, spaces, deep paths, both ends of compression |
-| `92-symlinks` | stored as a link, followed, or left out |
+| `92-symlinks` | materialized by default or counted and omitted |
 | `93-geometry-edges` | shard sizes and recovery percentages at their limits |
 | `94-bad-input` | wrong keys, wrong files, wrong control files, all refused |
 | `95-cli-contract` | exit codes, streams, argument order, config discovery |

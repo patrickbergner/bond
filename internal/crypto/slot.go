@@ -16,8 +16,9 @@ const (
 	SlotKeyfile    SlotType = 2
 
 	// SlotPlaintext wraps the master key under an all-zero key-encryption key.
-	// It is what "encryptionMethod: NONE" produces: the container is still
-	// authenticated end to end, but anyone holding it can open it. Reusing the
+	// It is what "encryptionMethod: NONE" produces: tags still detect accidental
+	// corruption, but anyone holding the container can open it and can therefore
+	// create replacement data with valid tags. Reusing the
 	// wrapping path rather than special-casing an unencrypted container means
 	// there is exactly one way in, and one way to get it wrong.
 	SlotPlaintext SlotType = 3
@@ -57,6 +58,78 @@ var DefaultKDF = KDFParams{MemoryKiB: 512 * 1024, Iterations: 3, Parallelism: 4}
 // LowMemoryKDF is RFC 9106's second recommended profile, for machines that
 // cannot spare half a gigabyte. It is weaker, and BOND only uses it when asked.
 var LowMemoryKDF = KDFParams{MemoryKiB: 64 * 1024, Iterations: 3, Parallelism: 4}
+
+// ErrKDFPolicy means a valid Argon2 profile exceeds the amount of
+// unauthenticated work this process is willing to perform. Slot parameters are
+// not authenticated until after a key has been recovered, so format validity
+// alone is not a safe admission policy for them.
+var ErrKDFPolicy = errors.New("argon2 parameters exceed the local safety policy")
+
+// KDFPolicy bounds one Argon2 derivation and the number of derivations an
+// unlock may start. Work is measured as KiB-passes: memoryKiB * iterations.
+//
+// The two halves do different jobs. The cost limits bound what a single edited
+// slot record can demand – the memory ceiling is the one that matters, because
+// a four-byte lie about MemoryKiB is otherwise a request for petabytes.
+// MaxDerivations bounds how many times that cost can be paid, because a table
+// may declare up to maxSlots slots and each is tried against every secret
+// offered.
+//
+// There is deliberately no cumulative *work* ceiling. Any such number is either
+// above slots × MaxWorkKiBPasses, in which case the per-derivation cap already
+// enforces it, or below it – in which case it refuses containers BOND itself
+// wrote. An earlier version used six GiB-passes, which is four derivations at
+// the default profile: a perfectly ordinary container with five passphrase
+// slots then failed to open, reporting that its own default parameters exceeded
+// the safety policy and suggesting --allow-expensive-kdf. Bounding the count
+// says the same thing about hostile input without lying about legitimate input.
+type KDFPolicy struct {
+	MaxMemoryKiB     uint32
+	MaxIterations    uint32
+	MaxParallelism   uint32
+	MaxWorkKiBPasses uint64
+	MaxDerivations   uint32
+	AllowExpensive   bool
+}
+
+// DefaultKDFPolicy accepts the normal profile and modestly stronger archival
+// profiles without allowing a damaged slot to consume unbounded resources.
+//
+// MaxDerivations is twice the largest slot table the format allows, so every
+// slot of a full container gets a turn against two offered secrets before the
+// limit is anywhere near. Memory stays bounded at MaxMemoryKiB throughout,
+// because the derivations run one after another.
+var DefaultKDFPolicy = KDFPolicy{
+	MaxMemoryKiB:     1024 * 1024,
+	MaxIterations:    6,
+	MaxParallelism:   64,
+	MaxWorkKiBPasses: 3 * 1024 * 1024,
+	MaxDerivations:   64,
+}
+
+// Work is the memory-pass product used by the reader's cumulative budget.
+func (p KDFParams) Work() uint64 { return uint64(p.MemoryKiB) * uint64(p.Iterations) }
+
+// Check applies local resource limits after checking permanent format rules.
+func (p KDFParams) Check(policy KDFPolicy) error {
+	if err := p.Validate(); err != nil {
+		return err
+	}
+	if policy.AllowExpensive {
+		return nil
+	}
+	switch {
+	case p.MemoryKiB > policy.MaxMemoryKiB:
+		return fmt.Errorf("%w: memory is %d KiB, limit is %d KiB", ErrKDFPolicy, p.MemoryKiB, policy.MaxMemoryKiB)
+	case p.Iterations > policy.MaxIterations:
+		return fmt.Errorf("%w: passes are %d, limit is %d", ErrKDFPolicy, p.Iterations, policy.MaxIterations)
+	case p.Parallelism > policy.MaxParallelism:
+		return fmt.Errorf("%w: lanes are %d, limit is %d", ErrKDFPolicy, p.Parallelism, policy.MaxParallelism)
+	case p.Work() > policy.MaxWorkKiBPasses:
+		return fmt.Errorf("%w: work is %d KiB-passes, limit is %d", ErrKDFPolicy, p.Work(), policy.MaxWorkKiBPasses)
+	}
+	return nil
+}
 
 // Validate rejects parameters that would not harden anything.
 func (p KDFParams) Validate() error {

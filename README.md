@@ -34,7 +34,8 @@ and it may still have the file long after you have forgotten it or the machine t
 - **Zero trust in the destination.** The operator gets an opaque file. File names, source paths and per-file sizes
   are sealed along with the data, so a storage provider can see nothing about what is inside it. All internal
   container structures are authenticated, so a container that was altered on the way is refused rather than
-  restored. This is what makes it reasonable to put critical files in a zero trust environment.
+  restored when the storage provider does not possess an unlocking secret. `NONE` is explicitly different: it offers
+  corruption detection but neither confidentiality nor malicious-tamper authenticity.
 - **Creating a backup needs no secret.** When using asymmetric keys, BOND only needs the *public key* on the machine
   making the backup: the job runs unattended and cannot read back what it just wrote, and a host compromised next year
   gives up nothing about the backups it already shipped. One public key in one control file scales to thousands of
@@ -60,7 +61,7 @@ and it may still have the file long after you have forgotten it or the machine t
   technical details, including decrypting a container by hand, because a format only its own tool can read is a
   single point of failure.
 - **None of the above is claimed untested.** Every promise on this page is checked by something that fails when it
-  stops being true – a single-bit sweep across a whole container, seven fuzz targets, and an
+  stops being true – a single-bit sweep across a whole container, six fuzz targets, and an
   [end-to-end suite](testsuite/) that damages, splits, loses and repairs real containers through the real command
   line. See [how it is tested](#how-it-is-tested).
 
@@ -109,13 +110,20 @@ re-encrypts anything, and it says so before it starts.
 | **passphrase** | typed, or `--passphrase-file` | the same passphrase |
 | **key file** | the file | the file |
 | **recovery card** | *nothing but a public key* | the printed key |
-| **none** | nothing | nothing – no confidentiality, integrity only |
+| **none** | nothing | nothing – no confidentiality; corruption detection only |
 
 The recovery card is the interesting one. `bond keygen --recovery-card` writes a printable key and a public key; only
 the public key goes in the control file, so a scheduled backup runs unattended and **the machine making the backup
 cannot read it**. Print the card, put it in a safe, delete it from the machine. Restoring is
 `bond restore backup.bond --to ./restored --recovery-key "BOND-R1-…"`; case and hyphens do not matter, and the letters
 that get misread – I, L, O – are accepted and corrected.
+
+Before authentication, passphrase slots are limited to 1 GiB memory, 6 passes, 64 lanes and 3 GiB-passes per
+derivation, and one unlock runs at most 64 of them. This prevents a damaged or hostile container from requesting
+unbounded Argon2 work, and is set so that a container using BOND's own defaults in every slot the format allows still
+opens on the last one tried. `--allow-expensive-kdf` on commands that unlock a container bypasses those local
+willingness limits, keeps the format validity checks, and prints a resource-risk warning; use it only for a container
+whose unusual costs are expected.
 
 ### Volumes
 
@@ -162,10 +170,15 @@ be empty: a file that is already there stops the restore unless `--overwrite` is
 destination usually means the wrong one was named.
 
 Every shard is authenticated as it is read, so nothing that failed its tag reaches the decompressor. Every archive
-name is checked before a file is created: absolute paths, `..`, drive letters, Windows
-device names and links pointing outside the destination abort the whole restore rather than being skipped. Each
-restored file is then hashed and compared with the digest recorded when it was backed up, and `bond restore` reports
-how many matched.
+name is checked before a file is created: absolute paths, `..`, drive letters, Windows device names and every link
+entry abort the whole restore rather than being skipped. Archive entry names are confined lexically below the selected
+destination. Existing symlinks, junctions and other filesystem redirections below it follow normal operating-system
+behavior and are the user's responsibility; restore into a new or suitably prepared directory if that is not desired.
+Each restored file is then hashed and compared with the digest recorded when it was backed up, and `bond restore`
+reports how many matched. `--include` restores a subset but still reads and hashes the whole archive, because a
+container is one sealed stream and checking only the part asked for would leave the rest unexamined — so a partial
+restore costs the time of a full one, and a digest that does not match anywhere fails it. The count reported as
+verified is the files actually written.
 
 ### The restore drill
 
@@ -207,6 +220,10 @@ Each source is a directory tree plus filters, all matched against the source-rel
 An exclusion always wins. If any include list is non-empty the default flips to deny, which is how "this subtree,
 except these bits" is written.
 
+`followSymlinks` defaults to `true`. Links to files and directories are materialized at the link's archive path; a
+directory loop is cut at that edge with a warning, while repeated non-cyclic aliases are each archived. Set it to
+`false` to omit included links with a counted warning. BOND never stores or restores a link entry.
+
 Files land in the archive under the longest common ancestor of the sources' parent directories, so
 `D:\Apps\Notepad++` and `D:\Apps\7-Zip` become `Notepad++/…` and `7-Zip/…`. When sources span Windows drives or
 UNC shares there is no common ancestor and each root becomes synthetic – `c_drive/…`, `d_drive/…`,
@@ -232,7 +249,7 @@ The embedded binaries are **not** committed. `tools/fetch` downloads a release p
 Two layers, and both run from a checkout.
 
 `go test ./...` covers the packages and the format: a single-bit sweep that flips every byte of a container in turn
-and requires each one to be caught, seven fuzz targets whose corpus runs on every invocation, the parity capacity
+and requires each one to be caught, six fuzz targets whose corpus runs on every invocation, the parity capacity
 arithmetic, a peak-memory ceiling, and full round trips through the real 7-Zip.
 
 [testsuite/](testsuite/) covers the *binary* – the part no package test can reach. Fourteen cases drive the built

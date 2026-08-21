@@ -2,7 +2,6 @@ package format
 
 import (
 	"bytes"
-	"encoding/binary"
 	"testing"
 	"time"
 
@@ -171,34 +170,13 @@ func TestReservedBytesAreCoveredByTheMAC(t *testing.T) {
 	}
 }
 
-// A header field that this build does not interpret still has to be covered,
-// or a later minor version could not add one without every older reader
-// refusing the container.
-func TestUnknownFieldsStayAuthenticated(t *testing.T) {
-	keys, err := crypto.Derive(bytes.Repeat([]byte{11}, crypto.KeyLen), make([]byte, 16))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Stand in for a later version: a field in the reserved region, signed by
-	// the writer that understood it.
+func TestUnknownVersionsAndFlagsAreRefused(t *testing.T) {
 	future := header(func(sb *Superblock) { sb.VersionMinor = VersionMinor + 1 }).Marshal()
-	binary.LittleEndian.PutUint64(future[offReserved:], 0xDEADBEEF)
-
-	parsed, err := Unmarshal(future)
-	if err != nil {
-		t.Fatalf("a later minor version was refused outright: %v", err)
+	if _, err := Unmarshal(future); err == nil {
+		t.Fatal("a later minor version was accepted without an explicit format implementation")
 	}
-	parsed.KeyCommitment = keys.Commitment(parsed.ContainerUUID)
-	parsed.Sign(keys.Header)
-
-	// Signing renders the header canonically, which is what a writer does. What
-	// matters is that a reader can then authenticate the bytes it finds.
-	reread, err := Unmarshal(parsed.Marshal())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := reread.Verify(keys); err != nil {
-		t.Errorf("a signed header did not verify after a round trip: %v", err)
+	flagged := header(func(sb *Superblock) { sb.Flags = 1 << 63 }).Marshal()
+	if _, err := Unmarshal(flagged); err == nil {
+		t.Fatal("an unknown feature flag was accepted")
 	}
 }

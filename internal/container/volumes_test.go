@@ -556,12 +556,9 @@ func openUnlockedSplit(t *testing.T, base string) *Reader {
 	return r
 }
 
-// A container written before every volume carried a mirror has its payload
-// running to the very end of each middle file. Healing "both copies" of such a
-// volume's header would write 4 KiB over the last shard in it – destroying
-// payload in the name of repairing the container. The reader tells the two
-// shapes apart by whether there is room, not by a version number.
-func TestRepairDoesNotWriteAMirrorWhereThereIsNoRoom(t *testing.T) {
+// Format 1.0 requires every volume to carry a mirror. Losing one is reported
+// as degraded metadata and repair appends the exact authenticated header again.
+func TestRepairRestoresRequiredMirrors(t *testing.T) {
 	const limit = format.PayloadOffset + (400 << 10)
 	base, payload := buildSplit(t, 2<<20, limit, 20)
 
@@ -575,8 +572,8 @@ func TestRepairDoesNotWriteAMirrorWhereThereIsNoRoom(t *testing.T) {
 		t.Fatalf("expected several volumes, got %d", volumes)
 	}
 
-	// Cut the mirror off every middle volume, which is exactly the older shape.
-	for i := 1; i < volumes-1; i++ {
+	// Cut the required mirror off the first, every middle and the last volume.
+	for i := 0; i < volumes; i++ {
 		path := base + VolumeSuffix(i)
 		info, err := os.Stat(path)
 		if err != nil {
@@ -589,19 +586,17 @@ func TestRepairDoesNotWriteAMirrorWhereThereIsNoRoom(t *testing.T) {
 
 	r, err := Open(base)
 	if err != nil {
-		t.Fatalf("a container in the older shape did not open: %v", err)
+		t.Fatalf("a container with degraded mirrors did not open: %v", err)
 	}
 	defer r.Close()
 	if err := r.Unlock(crypto.Passphrase(testPass)); err != nil {
 		t.Fatal(err)
 	}
-	// It is not damaged: those volumes never had a mirror to lose.
-	if n := r.Notices(); len(n) != 0 {
-		t.Errorf("an older container was reported as damaged: %v", n)
+	if n := r.Notices(); len(n) != volumes {
+		t.Errorf("reported %d missing mirrors, want %d: %v", len(n), volumes, n)
 	}
 
-	// Heal the metadata anyway, which is what a repair of this container would
-	// do, and prove it did not eat the payload.
+	// Heal the metadata and prove the mirrors are appended without eating payload.
 	fixed := filepath.Join(t.TempDir(), "fixed.bond")
 	out, err := copySet(r.vols, fixed)
 	if err != nil {
@@ -624,6 +619,9 @@ func TestRepairDoesNotWriteAMirrorWhereThereIsNoRoom(t *testing.T) {
 	defer again.Close()
 	if err := again.Unlock(crypto.Passphrase(testPass)); err != nil {
 		t.Fatal(err)
+	}
+	if len(again.Notices()) != 0 {
+		t.Errorf("healed container is still degraded: %v", again.Notices())
 	}
 	if got := readAll(t, again); !bytes.Equal(got, payload) {
 		t.Error("healing the headers of an older container destroyed payload")

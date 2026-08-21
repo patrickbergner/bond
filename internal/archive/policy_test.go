@@ -183,37 +183,23 @@ func TestExtractRefusesUnsupportedEntryTypes(t *testing.T) {
 	}
 }
 
-func TestExtractRefusesEscapingSymlinks(t *testing.T) {
-	targets := []string{"../outside", "/etc/passwd", "C:/Windows", `\\server\share`, ""}
+// A link is the one entry that still points somewhere after the restore has
+// finished, so the format does not carry one and the reader refuses every one it
+// meets – whether its target escapes, whether it is harmless, and whatever was
+// asked for. There is no option that turns this off, which is why the targets
+// below are not a separate escaping case: nothing about the target is consulted.
+func TestExtractRejectsEverySymlink(t *testing.T) {
+	targets := []string{"inside.txt", "../outside", "/etc/passwd", "C:/Windows", `\\server\share`, ""}
 	for _, target := range targets {
 		dest, checkOutside := arena(t)
 		data := hostile(t, tar.Header{Name: "link", Typeflag: tar.TypeSymlink, Linkname: target})
-		_, err := Extract(context.Background(), bytes.NewReader(data), ExtractOptions{
-			Dest:          dest,
-			AllowSymlinks: true,
-		})
-		if err == nil {
+		if _, err := Extract(context.Background(), bytes.NewReader(data), ExtractOptions{Dest: dest}); err == nil {
 			t.Errorf("Extract accepted a symlink to %q", target)
 		}
+		if _, err := os.Lstat(filepath.Join(dest, "link")); err == nil {
+			t.Errorf("a symlink to %q was created at the destination", target)
+		}
 		checkOutside()
-	}
-}
-
-// A symlink is the one entry that still points somewhere after the restore has
-// finished, so it takes an explicit decision to restore one at all.
-func TestExtractSkipsSymlinksByDefault(t *testing.T) {
-	dest, _ := arena(t)
-	data := hostile(t, tar.Header{Name: "link", Typeflag: tar.TypeSymlink, Linkname: "inside.txt"})
-
-	stats, err := Extract(context.Background(), bytes.NewReader(data), ExtractOptions{Dest: dest})
-	if err != nil {
-		t.Fatalf("Extract: %v", err)
-	}
-	if stats.Symlinks != 0 || stats.Skipped != 1 {
-		t.Errorf("stats = %+v, want the link skipped", stats)
-	}
-	if _, err := os.Lstat(filepath.Join(dest, "link")); err == nil {
-		t.Error("the symlink was created even though symlinks were off")
 	}
 }
 

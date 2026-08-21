@@ -314,14 +314,15 @@ func (t *repairTarget) healMetadata(r *Reader) ([]string, error) {
 		if _, err := t.files[i].WriteAt(header, 0); err != nil {
 			return nil, err
 		}
-		// Only where the container left room for a mirror. A set written before
-		// every volume carried one has its payload running to the very end of
-		// each middle file, and writing a header there would destroy the last
-		// shard in it – in the name of repairing the container.
-		if !v.mirrorRoom() {
-			continue
+		mirrorAt := v.payloadStart + v.logicalLen
+		if i == len(r.vols.vols)-1 {
+			mirrorAt += int64(2 * v.sb.TailLength)
 		}
-		if _, err := t.files[i].WriteAt(header, t.sizes[i]-format.SuperblockSize); err != nil {
+		if err := t.files[i].Truncate(mirrorAt + format.SuperblockSize); err != nil {
+			return nil, err
+		}
+		t.sizes[i] = mirrorAt + format.SuperblockSize
+		if _, err := t.files[i].WriteAt(header, mirrorAt); err != nil {
 			return nil, err
 		}
 	}

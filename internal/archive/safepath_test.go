@@ -73,6 +73,20 @@ func TestCheckNameWindowsSpecifics(t *testing.T) {
 		if err := checkName(name, false); err != nil {
 			t.Errorf("checkName(%q, windows=false) = %v, want it accepted on POSIX", name, err)
 		}
+		// The same names read the same way everywhere, which is what lets the
+		// manifest validate an index without the reader's platform deciding
+		// whether the container opens at all.
+		if err := CheckPortableName(name); err != nil {
+			t.Errorf("CheckPortableName(%q) = %v, want it accepted on every platform", name, err)
+		}
+	}
+}
+
+func TestCheckPortableNameStillRefusesEscapes(t *testing.T) {
+	for _, name := range []string{"", "/etc/passwd", "../outside", "..", "a/./b", "a//b", `\\server\share`, "C:/Windows", "a\x00b"} {
+		if err := CheckPortableName(name); err == nil {
+			t.Errorf("CheckPortableName(%q) accepted it", name)
+		}
 	}
 }
 
@@ -93,43 +107,6 @@ func TestSafeJoin(t *testing.T) {
 	for _, name := range []string{"../x", "/x", "a/../../x"} {
 		if _, err := SafeJoin(dest, name); err == nil {
 			t.Errorf("SafeJoin(%q) succeeded, want a refusal", name)
-		}
-	}
-}
-
-func TestCheckLink(t *testing.T) {
-	ok := []struct{ link, target string }{
-		{"a/b/link", "c.txt"},
-		{"a/b/link", "../c.txt"},
-		{"a/b/link", "../../a/c.txt"},
-		{"link", "dir/file"},
-	}
-	for _, tc := range ok {
-		if err := CheckLink(tc.link, tc.target); err != nil {
-			t.Errorf("CheckLink(%q, %q) = %v, want it accepted", tc.link, tc.target, err)
-		}
-	}
-
-	bad := []struct{ link, target string }{
-		{"link", ""},
-		{"link", "/etc/passwd"},
-		{"link", "C:/Windows"},
-		{"link", `\\server\share`},
-		{"link", "../outside"},              // at the root, one level up is already out
-		{"a/link", "../../outside"},         // two levels up from depth one
-		{"a/b/link", "../../../../outside"}, // deeper attempt
-
-		// Found by FuzzCheckLink. A single leading backslash is rooted on
-		// Windows, and normalising the target after the absolute check turned
-		// this into "/..", which path.Join then cleaned to "/" – losing the
-		// component that made it an escape.
-		{"0", `\..`},
-		{"a/link", `\..\..\outside`},
-		{"link", `..\outside`},
-	}
-	for _, tc := range bad {
-		if err := CheckLink(tc.link, tc.target); err == nil {
-			t.Errorf("CheckLink(%q, %q) accepted it, want a refusal", tc.link, tc.target)
 		}
 	}
 }

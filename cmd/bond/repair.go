@@ -125,7 +125,8 @@ options:
 	if err != nil {
 		return err
 	}
-	if err := fixed.Unlock(secrets...); err != nil {
+	defer wipeUnlockers(secrets)
+	if err := fixed.UnlockWithOptions(keys.unlockOptions(), secrets...); err != nil {
 		return fmt.Errorf("the repaired container does not unlock: %w", err)
 	}
 	after, err := fixed.Verify(nil)

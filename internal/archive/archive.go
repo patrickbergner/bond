@@ -20,15 +20,12 @@ type Kind uint8
 const (
 	KindFile Kind = iota
 	KindDir
-	KindSymlink
 )
 
 func (k Kind) String() string {
 	switch k {
 	case KindDir:
 		return "directory"
-	case KindSymlink:
-		return "symlink"
 	default:
 		return "file"
 	}
@@ -37,13 +34,13 @@ func (k Kind) String() string {
 // Entry is one thing to store. Path is the name inside the archive, '/'
 // separated and relative; Disk is where to read the content from.
 type Entry struct {
-	Path    string
-	Disk    string
-	Kind    Kind
-	Size    int64
-	Mode    fs.FileMode
-	ModTime time.Time
-	Link    string
+	Path     string
+	Disk     string
+	Kind     Kind
+	Size     int64
+	Mode     fs.FileMode
+	ModTime  time.Time
+	Expected fs.FileInfo
 }
 
 // FileInfo is what the manifest records about one stored entry. The digest is
@@ -55,6 +52,5 @@ type FileInfo struct {
 	Size    int64       `json:"size,omitempty"`
 	Mode    fs.FileMode `json:"mode"`
 	ModTime time.Time   `json:"modTime"`
-	Link    string      `json:"link,omitempty"`
 	SHA256  string      `json:"sha256,omitempty"`
 }

@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/patrickbergner/bond/internal/archive"
 	"github.com/patrickbergner/bond/internal/crypto"
+	"github.com/patrickbergner/bond/internal/parity"
 )
 
 // Manifest is everything about a container that is not raw payload: what was
@@ -43,13 +46,13 @@ type Manifest struct {
 	SyntheticRoots bool   `json:"syntheticRoots,omitempty"`
 	FollowSymlinks bool   `json:"followSymlinks,omitempty"`
 
-	Files    int   `json:"files"`
-	Dirs     int   `json:"dirs"`
-	Symlinks int   `json:"symlinks"`
-	Bytes    int64 `json:"bytes"`
+	Files           int   `json:"files"`
+	Dirs            int   `json:"dirs"`
+	SkippedSymlinks int   `json:"skippedSymlinks"`
+	Bytes           int64 `json:"bytes"`
 
-	// Index is the file list. Absent when storeFileIndex is off.
-	Index []archive.FileInfo `json:"index,omitempty"`
+	IndexStored bool               `json:"indexStored"`
+	Index       []archive.FileInfo `json:"index,omitempty"`
 }
 
 // Compression records how the payload was produced.
@@ -132,14 +135,136 @@ func OpenManifest(framed []byte, c crypto.Cipher, manifestKey, containerUUID []b
 	}
 	defer zr.Close()
 
-	plain, err := io.ReadAll(io.LimitReader(zr, maxManifestSize))
+	plain, err := io.ReadAll(io.LimitReader(zr, maxManifestSize+1))
 	if err != nil {
 		return nil, fmt.Errorf("the manifest is not readable: %w", err)
 	}
 
+	if len(plain) > maxManifestSize {
+		return nil, fmt.Errorf("the manifest expands beyond the %d-byte limit", maxManifestSize)
+	}
 	var m Manifest
-	if err := json.Unmarshal(plain, &m); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(plain))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&m); err != nil {
 		return nil, fmt.Errorf("the manifest is not readable: %w", err)
 	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			err = fmt.Errorf("more than one JSON value is present")
+		}
+		return nil, fmt.Errorf("the manifest has trailing data: %w", err)
+	}
+	if err := m.Validate(); err != nil {
+		return nil, fmt.Errorf("the manifest is invalid: %w", err)
+	}
 	return &m, nil
+}
+
+// Validate checks the authenticated manifest's semantic contract. Strict
+// validation turns future format drift into a clear version error instead of a
+// late restore failure or an accidental fallback to raw tar.
+func (m *Manifest) Validate() error {
+	if m.FormatVersion != VersionMajor {
+		return fmt.Errorf("format version %d is unsupported; want %d", m.FormatVersion, VersionMajor)
+	}
+	if m.Created.IsZero() {
+		return fmt.Errorf("creation time is missing")
+	}
+	switch m.Compression.Format {
+	case "none":
+		if m.Compression.Level != 0 {
+			return fmt.Errorf("uncompressed stream records compression level %d", m.Compression.Level)
+		}
+	case "xz":
+		if m.Compression.Level < 1 || m.Compression.Level > 9 {
+			return fmt.Errorf("xz compression level %d is outside 1..9", m.Compression.Level)
+		}
+	default:
+		return fmt.Errorf("compression format %q is unsupported", m.Compression.Format)
+	}
+	if !m.Compression.Solid {
+		return fmt.Errorf("the payload is not recorded as a solid stream")
+	}
+	if m.StreamLength < 0 || m.ShardSize < 0 || m.DataShardCount < 0 ||
+		m.RecoveryPercent < 0 || m.DataShards < 0 || m.ParityShards < 0 ||
+		m.Files < 0 || m.Dirs < 0 || m.SkippedSymlinks < 0 || m.Bytes < 0 {
+		return fmt.Errorf("manifest counts and sizes must not be negative")
+	}
+	if m.ShardSize <= crypto.TagLen || m.ShardSize%4096 != 0 {
+		return fmt.Errorf("shardSize %d is not a positive multiple of 4096 with room for an authentication tag", m.ShardSize)
+	}
+	plainPerShard := m.ShardSize - crypto.TagLen
+	expectedShards := int64(0)
+	if m.StreamLength > 0 {
+		expectedShards = (m.StreamLength + plainPerShard - 1) / plainPerShard
+	}
+	if m.DataShardCount != expectedShards {
+		return fmt.Errorf("dataShardCount is %d, stream length and shard size require %d", m.DataShardCount, expectedShards)
+	}
+	digest, err := hex.DecodeString(m.StreamSHA256)
+	if err != nil || len(digest) != 32 || strings.ToLower(m.StreamSHA256) != m.StreamSHA256 {
+		return fmt.Errorf("streamSha256 is not a lowercase SHA-256 digest")
+	}
+	plan, err := parity.For(m.RecoveryPercent)
+	if err != nil {
+		return err
+	}
+	if m.DataShards != plan.Data || m.ParityShards != plan.Parity {
+		return fmt.Errorf("recovery percent %d requires a %d+%d stripe, manifest records %d+%d",
+			m.RecoveryPercent, plan.Data, plan.Parity, m.DataShards, m.ParityShards)
+	}
+	if !m.IndexStored {
+		if len(m.Index) != 0 {
+			return fmt.Errorf("indexStored is false but an index is present")
+		}
+		return nil
+	}
+
+	seen := make(map[string]bool, len(m.Index))
+	var files, dirs int
+	var bytesTotal int64
+	for i, entry := range m.Index {
+		// Portable rules only. A name Windows cannot create is still a valid
+		// thing for a container to hold, and refusing it here would make the
+		// container unopenable on Windows rather than making one entry
+		// unrestorable there. The restore path judges it, per entry, in SafeJoin.
+		if err := archive.CheckPortableName(entry.Path); err != nil {
+			return fmt.Errorf("index entry %d path %q: %w", i, entry.Path, err)
+		}
+		if seen[entry.Path] {
+			return fmt.Errorf("index path %q appears more than once", entry.Path)
+		}
+		seen[entry.Path] = true
+		if entry.ModTime.IsZero() {
+			return fmt.Errorf("index entry %q has no modification time", entry.Path)
+		}
+		switch entry.Kind {
+		case archive.KindDir:
+			dirs++
+			if entry.Size != 0 || entry.SHA256 != "" {
+				return fmt.Errorf("directory %q carries file size or digest data", entry.Path)
+			}
+		case archive.KindFile:
+			files++
+			if entry.Size < 0 {
+				return fmt.Errorf("file %q has negative size", entry.Path)
+			}
+			digest, err := hex.DecodeString(entry.SHA256)
+			if err != nil || len(digest) != 32 || strings.ToLower(entry.SHA256) != entry.SHA256 {
+				return fmt.Errorf("file %q has an invalid SHA-256 digest", entry.Path)
+			}
+			if entry.Size > int64(^uint64(0)>>1)-bytesTotal {
+				return fmt.Errorf("indexed file sizes overflow their aggregate")
+			}
+			bytesTotal += entry.Size
+		default:
+			return fmt.Errorf("index entry %q has unsupported kind %d", entry.Path, entry.Kind)
+		}
+	}
+	if files != m.Files || dirs != m.Dirs || bytesTotal != m.Bytes {
+		return fmt.Errorf("index totals are %d files, %d directories and %d bytes; manifest records %d, %d and %d",
+			files, dirs, bytesTotal, m.Files, m.Dirs, m.Bytes)
+	}
+	return nil
 }

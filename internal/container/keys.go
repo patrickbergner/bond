@@ -1,9 +1,11 @@
 package container
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 
@@ -33,15 +35,14 @@ func UpdateSlots(path string, keys *crypto.Keys, slots []*crypto.Slot) error {
 	}
 	defer f.Close()
 
-	// The slot tables live in the first volume only. Handed a later one, the
-	// offsets below land in the middle of the payload, where the read succeeds
-	// and the parse fails with a message about a missing magic number – true,
-	// and no help at all in working out what went wrong.
-	head := make([]byte, format.SuperblockSize)
-	if _, err := f.ReadAt(head, 0); err != nil {
+	// Authenticate the header on this writable handle. The path may have been
+	// replaced since the Reader that supplied keys was opened, and a damaged
+	// leading copy may require the mirror at EOF.
+	sb, err := authenticatedHead(f, keys)
+	if err != nil {
 		return err
 	}
-	if sb, err := format.Unmarshal(head); err == nil && sb.VolumeIndex != 0 {
+	if sb.VolumeIndex != 0 {
 		return fmt.Errorf("%s is volume %d of %d, and the key slots live in the first one; run this against %s",
 			filepath.Base(path), sb.VolumeIndex+1, sb.VolumeCount,
 			filepath.Base(VolumeBase(path)+VolumeSuffix(0)))
@@ -56,18 +57,42 @@ func UpdateSlots(path string, keys *crypto.Keys, slots []*crypto.Slot) error {
 		return err
 	}
 
-	current, index, err := format.PickTable(a, b)
-	if err != nil {
-		return err
+	type authenticTable struct {
+		table *format.SlotTable
+		index int
+		raw   []byte
+	}
+	var authentic []authenticTable
+	for index, raw := range [][]byte{a, b} {
+		table, parseErr := format.ParseSlotTable(raw)
+		if parseErr != nil || table.Verify(keys.Header) != nil {
+			continue
+		}
+		authentic = append(authentic, authenticTable{table: table, index: index, raw: raw})
+	}
+	if len(authentic) == 0 {
+		return fmt.Errorf("neither key-slot table authenticates with this container's key")
+	}
+	current := authentic[0]
+	for _, candidate := range authentic[1:] {
+		switch {
+		case candidate.table.Generation > current.table.Generation:
+			current = candidate
+		case candidate.table.Generation == current.table.Generation && !bytes.Equal(candidate.raw, current.raw):
+			return fmt.Errorf("the two authentic key-slot tables have generation %d but different contents", current.table.Generation)
+		}
+	}
+	if current.table.Generation == math.MaxUint64 {
+		return fmt.Errorf("key-slot generation has reached its maximum value")
 	}
 
 	// Write into the other one.
 	target := int64(format.SlotTableAOffset)
-	if index == 0 {
+	if current.index == 0 {
 		target = format.SlotTableBOffset
 	}
 
-	next := &format.SlotTable{Generation: current.Generation + 1, Slots: slots}
+	next := &format.SlotTable{Generation: current.table.Generation + 1, Slots: slots}
 	encoded, err := next.Marshal(keys.Header)
 	if err != nil {
 		return err
@@ -75,7 +100,54 @@ func UpdateSlots(path string, keys *crypto.Keys, slots []*crypto.Slot) error {
 	if _, err := f.WriteAt(encoded, target); err != nil {
 		return err
 	}
-	return f.Sync()
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	written := make([]byte, format.SlotTableSize)
+	if _, err := f.ReadAt(written, target); err != nil {
+		return fmt.Errorf("reading back the updated key slots: %w", err)
+	}
+	checked, err := format.ParseSlotTable(written)
+	if err != nil {
+		return fmt.Errorf("the updated key slots cannot be parsed: %w", err)
+	}
+	if checked.Generation != next.Generation {
+		return fmt.Errorf("the updated key-slot generation is %d, want %d", checked.Generation, next.Generation)
+	}
+	if err := checked.Verify(keys.Header); err != nil {
+		return fmt.Errorf("the updated key slots fail authentication: %w", err)
+	}
+	return nil
+}
+
+func authenticatedHead(f *os.File, keys *crypto.Keys) (*format.Superblock, error) {
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	positions := []int64{0}
+	if info.Size() >= format.SuperblockSize {
+		positions = append(positions, info.Size()-format.SuperblockSize)
+	}
+	var found *format.Superblock
+	for _, at := range positions {
+		raw := make([]byte, format.SuperblockSize)
+		if _, err := f.ReadAt(raw, at); err != nil {
+			continue
+		}
+		sb, err := format.Unmarshal(raw)
+		if err != nil || sb.Verify(keys) != nil {
+			continue
+		}
+		if found != nil && !found.IdenticalTo(sb) {
+			return nil, fmt.Errorf("the two authentic header copies differ")
+		}
+		found = sb
+	}
+	if found == nil {
+		return nil, fmt.Errorf("neither header copy authenticates with this container's key")
+	}
+	return found, nil
 }
 
 // PayloadDigest hashes everything after the key-slot tables, across every

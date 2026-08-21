@@ -1,9 +1,11 @@
 package container
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/patrickbergner/bond/internal/format"
 )
@@ -244,25 +246,169 @@ func (w *volumeWriter) Paths() []string {
 	return out
 }
 
-// Publish moves the set to its destination, keeping the numbering.
+// Publish moves the set to its destination without replacing any existing
+// container or checksum namespace. For split sets volume 1 is the commit point:
+// every other volume and its directory entry are durable before it appears.
 func (w *volumeWriter) Publish(dst string) ([]string, error) {
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+	if err := validatePublication(filepath.Dir(w.base), dst, w.Paths()); err != nil {
 		return nil, err
 	}
-	published := make([]string, 0, len(w.files))
-	for _, vf := range w.files {
+	targets := make([]string, len(w.files))
+	for i := range w.files {
 		target := dst
 		if w.split {
-			target = dst + VolumeSuffix(vf.index)
+			target = dst + VolumeSuffix(i)
 		}
-		if err := os.Rename(vf.path, target); err != nil {
-			return published, err
+		targets[i] = target
+	}
+
+	order := make([]int, 0, len(w.files))
+	if w.split {
+		for i := 1; i < len(w.files); i++ {
+			order = append(order, i)
 		}
-		published = append(published, target)
+		order = append(order, 0)
+	} else {
+		order = append(order, 0)
 	}
-	if d, err := os.Open(filepath.Dir(dst)); err == nil {
-		d.Sync()
-		d.Close()
+
+	var moved []int
+	rollback := func(cause error) error {
+		var rollbackErrs []error
+		for i := len(moved) - 1; i >= 0; i-- {
+			index := moved[i]
+			if err := moveNoReplace(targets[index], w.files[index].path); err != nil {
+				rollbackErrs = append(rollbackErrs, fmt.Errorf("returning %s to staging: %w", filepath.Base(targets[index]), err))
+			}
+		}
+		return errors.Join(append([]error{cause}, rollbackErrs...)...)
 	}
-	return published, nil
+
+	for _, index := range order {
+		if w.split && index == 0 {
+			if err := syncDirectory(filepath.Dir(dst)); err != nil {
+				return nil, rollback(err)
+			}
+		}
+		if err := moveNoReplace(w.files[index].path, targets[index]); err != nil {
+			return nil, rollback(fmt.Errorf("publishing %s without replacement: %w", filepath.Base(targets[index]), err))
+		}
+		moved = append(moved, index)
+	}
+	if err := syncDirectory(filepath.Dir(dst)); err != nil {
+		return nil, rollback(err)
+	}
+	if filepath.Clean(filepath.Dir(w.base)) != filepath.Clean(filepath.Dir(dst)) {
+		if err := syncDirectory(filepath.Dir(w.base)); err != nil {
+			return nil, fmt.Errorf("syncing the staging directory after publication: %w", err)
+		}
+	}
+	return targets, nil
+}
+
+var (
+	moveNoReplace          = renameNoReplace
+	syncDirectory          = syncDir
+	validateMoveFilesystem = validateSameFilesystem
+)
+
+// ValidatePublication proves the staging and destination directories can use
+// one-filesystem atomic moves, and that no part of the requested output
+// namespace already exists. Callers do this before writing the payload;
+// Publish repeats it to close ordinary races.
+func ValidatePublication(stagingDir, dst string) error {
+	return validatePublication(stagingDir, dst, nil)
+}
+
+// validatePublication takes the paths the caller is about to move, so the
+// recheck inside Publish does not mistake the writer's own staging files for a
+// competing container. That happens whenever workPath and outputPath name the
+// same directory: the split staging volumes are called <base>.partial.001, and
+// a rule that only looked at the trailing digits matched them. The preflight
+// then passed, because nothing existed yet, and the recheck failed after the
+// whole backup had been written.
+func validatePublication(stagingDir, dst string, ours []string) error {
+	if err := os.MkdirAll(stagingDir, 0o700); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	if err := outputNamespaceAvailable(dst, ours); err != nil {
+		return err
+	}
+	if err := validateMoveFilesystem(stagingDir, filepath.Dir(dst)); err != nil {
+		return fmt.Errorf("publication requires atomic moves within one filesystem: %w", err)
+	}
+	return nil
+}
+
+// sidecarSuffixes are the checksum files WriteSidecar can produce. They are part
+// of the namespace a publication claims, because a stale digest beside a new
+// container is worse than no digest at all.
+var sidecarSuffixes = []string{".sha256", ".sha384", ".sha512"}
+
+// numberedVolumeOf reports whether name is base plus a volume suffix, by the
+// same rule VolumeFiles uses to discover a set. Matching the trailing digits
+// alone is not that rule: backup.bond.old.001 ends in a volume suffix but
+// belongs to backup.bond.old, and VolumeFiles correctly ignores it.
+func numberedVolumeOf(base, name string) bool {
+	match := volumePattern.FindString(name)
+	return match != "" && strings.TrimSuffix(name, match) == base
+}
+
+func occupiesNamespace(base, name string) bool {
+	if name == base || numberedVolumeOf(base, name) {
+		return true
+	}
+	for _, ext := range sidecarSuffixes {
+		if stem := strings.TrimSuffix(name, ext); stem != name {
+			if stem == base || numberedVolumeOf(base, stem) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func outputNamespaceAvailable(dst string, ours []string) error {
+	dir := filepath.Dir(dst)
+	base := filepath.Base(dst)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	staging := make(map[string]bool, len(ours))
+	for _, p := range ours {
+		staging[filepath.Clean(p)] = true
+	}
+
+	var taken []string
+	for _, entry := range entries {
+		full := filepath.Join(dir, entry.Name())
+		if occupiesNamespace(base, entry.Name()) && !staging[filepath.Clean(full)] {
+			taken = append(taken, entry.Name())
+		}
+	}
+	if len(taken) == 0 {
+		return nil
+	}
+	// Name them. BOND will not replace an existing backup, so the operator has
+	// to decide what happens to these files, and they cannot do that from a
+	// message that mentions only the first one it happened to see. A previous
+	// split set can be a thousand files, though, and a thousand-name error is
+	// no more usable than a one-name one.
+	them, listed := "it", taken
+	if len(taken) > 1 {
+		them = "them"
+	}
+	const show = 8
+	suffix := ""
+	if len(listed) > show {
+		suffix = fmt.Sprintf(" and %d more", len(listed)-show)
+		listed = listed[:show]
+	}
+	return fmt.Errorf("%s already holds %s%s, which is the namespace this container would be published into; "+
+		"BOND never replaces an existing backup, so move or delete %s first, or publish under another name",
+		dir, strings.Join(listed, ", "), suffix, them)
 }

@@ -41,12 +41,14 @@ func Rekey(ctx context.Context, r *container.Reader, dst string, keys []containe
 	started := time.Now()
 	old := r.Manifest()
 	sb := r.Superblock()
+	if err := container.ValidatePublication(workDir, dst); err != nil {
+		return nil, err
+	}
 
 	stream, err := r.Stream()
 	if err != nil {
 		return nil, err
 	}
-
 	work := filepath.Join(workDir, filepath.Base(dst)+".partial")
 	w, err := container.Create(work, container.Options{
 		ShardSize:       int64(sb.ShardSize),
@@ -58,6 +60,7 @@ func Rekey(ctx context.Context, r *container.Reader, dst string, keys []containe
 	if err != nil {
 		return nil, err
 	}
+	defer w.Destroy()
 	finished := false
 	defer func() {
 		if !finished {
@@ -79,11 +82,17 @@ func Rekey(ctx context.Context, r *container.Reader, dst string, keys []containe
 	if err := w.Finish(&m); err != nil {
 		return nil, err
 	}
+	if err := w.Validate(work); err != nil {
+		return nil, fmt.Errorf("the completed staging container fails authenticated readback: %w", err)
+	}
 	paths, err := w.Publish(dst)
 	if err != nil {
 		return nil, err
 	}
 	finished = true
+	if err := w.Validate(paths[0]); err != nil {
+		return nil, fmt.Errorf("the published container fails authenticated readback: %w", err)
+	}
 
 	if err := confirmReadable(paths[0], keys); err != nil {
 		return nil, err

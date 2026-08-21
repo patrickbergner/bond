@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 
+	"github.com/patrickbergner/bond/internal/archive"
 	"github.com/patrickbergner/bond/internal/config"
 	"github.com/patrickbergner/bond/internal/container"
 	"github.com/patrickbergner/bond/internal/crypto"
@@ -251,6 +253,122 @@ func TestListReadsTheIndexWithoutDecompressing(t *testing.T) {
 	}
 }
 
+func TestListDistinguishesAnIndexedEmptyArchive(t *testing.T) {
+	root, _ := fixture(t)
+	created := createContainer(t, root, settings(t, 0), []container.KeySpec{{Secret: crypto.Passphrase(pass), KDF: fastKDF}})
+	r, err := container.Open(created.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if err := r.Unlock(crypto.Passphrase(pass)); err != nil {
+		t.Fatal(err)
+	}
+	r.Manifest().IndexStored = true
+	r.Manifest().Index = nil
+	r.Manifest().Files, r.Manifest().Dirs, r.Manifest().Bytes = 0, 0, 0
+	entries, err := ListEntries(r)
+	if err != nil {
+		t.Fatalf("indexed empty archive returned entries=%v, err=%v", entries, err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("indexed empty archive returned %d entries", len(entries))
+	}
+}
+
+func TestRestoreReconcilesManifestForPartialAndUnindexedRestores(t *testing.T) {
+	root, _ := fixture(t)
+	keys := []container.KeySpec{{Secret: crypto.Passphrase(pass), KDF: fastKDF}}
+
+	t.Run("indexed partial restore", func(t *testing.T) {
+		created := createContainer(t, root, settings(t, 0), keys)
+		r, err := container.Open(created.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Close()
+		if err := r.Unlock(crypto.Passphrase(pass)); err != nil {
+			t.Fatal(err)
+		}
+		r.Manifest().Index[0].Path = "manifest-does-not-match"
+		_, err = Restore(context.Background(), r, RestoreOptions{
+			Dest:    t.TempDir(),
+			Include: func(string) bool { return false },
+		})
+		if err == nil || !strings.Contains(err.Error(), "manifest index") {
+			t.Fatalf("partial restore mismatch error = %v", err)
+		}
+	})
+
+	t.Run("partial restore verifies excluded file digests", func(t *testing.T) {
+		created := createContainer(t, root, settings(t, 0), keys)
+		r, err := container.Open(created.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Close()
+		if err := r.Unlock(crypto.Passphrase(pass)); err != nil {
+			t.Fatal(err)
+		}
+		for i := range r.Manifest().Index {
+			if r.Manifest().Index[i].Kind == archive.KindFile {
+				r.Manifest().Index[i].SHA256 = strings.Repeat("0", 64)
+				break
+			}
+		}
+		_, err = Restore(context.Background(), r, RestoreOptions{
+			Dest:    t.TempDir(),
+			Include: func(string) bool { return false },
+		})
+		if err == nil || !strings.Contains(err.Error(), "digests") {
+			t.Fatalf("excluded digest mismatch error = %v", err)
+		}
+	})
+
+	t.Run("unindexed aggregate", func(t *testing.T) {
+		s := settings(t, 0)
+		s.StoreFileIndex = false
+		created := createContainer(t, root, s, keys)
+		r, err := container.Open(created.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Close()
+		if err := r.Unlock(crypto.Passphrase(pass)); err != nil {
+			t.Fatal(err)
+		}
+		r.Manifest().Files++
+		_, err = Restore(context.Background(), r, RestoreOptions{Dest: t.TempDir()})
+		if err == nil || !strings.Contains(err.Error(), "archive totals") {
+			t.Fatalf("aggregate mismatch error = %v", err)
+		}
+	})
+}
+
+func TestRestoreRejectsUnknownCompression(t *testing.T) {
+	root, _ := fixture(t)
+	created := createContainer(t, root, settings(t, 0), []container.KeySpec{{Secret: crypto.Passphrase(pass), KDF: fastKDF}})
+	r, err := container.Open(created.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if err := r.Unlock(crypto.Passphrase(pass)); err != nil {
+		t.Fatal(err)
+	}
+	r.Manifest().Compression.Format = "future"
+	if _, err := Restore(context.Background(), r, RestoreOptions{Dest: t.TempDir()}); err == nil || !strings.Contains(err.Error(), "unsupported compression") {
+		t.Fatalf("unknown compression error = %v", err)
+	}
+}
+
+func TestIncompleteRestoreErrorIsTyped(t *testing.T) {
+	err := &IncompleteRestoreError{Issues: []archive.MetadataIssue{{Path: "dir", Operation: "permissions", Err: errors.New("denied")}}}
+	if !errors.Is(err, ErrIncompleteRestore) || !strings.Contains(err.Error(), "incomplete") {
+		t.Fatalf("incomplete restore error = %v", err)
+	}
+}
+
 // Damage after the container was written must be caught before anything is
 // restored from it.
 func TestDamageIsCaughtOnRestore(t *testing.T) {
@@ -309,6 +427,19 @@ func TestSidecarDetectsAChangedContainer(t *testing.T) {
 
 	if _, err := CheckSidecar(created.Path); err == nil {
 		t.Error("the checksum file did not notice a changed container")
+	}
+}
+
+func TestSidecarIsNoClobber(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "container.bond")
+	if err := os.WriteFile(path, []byte("container"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := WriteSidecar(path, config.HashSHA256); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := WriteSidecar(path, config.HashSHA256); err == nil {
+		t.Fatal("WriteSidecar replaced an existing checksum")
 	}
 }
 

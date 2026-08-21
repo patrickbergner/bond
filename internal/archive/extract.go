@@ -17,17 +17,14 @@ import (
 
 // ExtractOptions govern a restore.
 type ExtractOptions struct {
-	// Dest is the directory everything is written under. Nothing outside it is
-	// ever touched.
+	// Dest is the lexical root for archive entry names. Existing filesystem
+	// links or redirections below it retain their ordinary operating-system
+	// semantics.
 	Dest string
 
 	// Include, when set, selects which entries to restore. Everything else is
 	// skipped without being read.
 	Include func(archivePath string) bool
-
-	// AllowSymlinks restores symlinks. Off by default: a link is the one entry
-	// type that can point somewhere else after the restore has finished.
-	AllowSymlinks bool
 
 	// Overwrite replaces files that already exist at the destination.
 	Overwrite bool
@@ -35,18 +32,45 @@ type ExtractOptions struct {
 	// OnEntry, if set, is called for each entry restored.
 	OnEntry func(FileInfo)
 
+	// OnArchiveEntry observes every validated tar header, including entries
+	// excluded from a partial restore.
+	OnArchiveEntry func(FileInfo) error
+
+	// OnArchiveFile observes every file after its bytes have been read and
+	// hashed, including files excluded from a partial restore.
+	OnArchiveFile func(FileInfo) error
+
 	// OnWarning reports an entry that was skipped for a reason worth naming.
 	OnWarning func(path, msg string)
 }
 
 // ExtractStats summarises a restore.
 type ExtractStats struct {
-	Files    int
-	Dirs     int
-	Symlinks int
-	Skipped  int
-	Bytes    int64
+	Files          int
+	Dirs           int
+	Skipped        int
+	Bytes          int64
+	MetadataIssues []MetadataIssue
+	ArchiveFiles   int
+	ArchiveDirs    int
+	ArchiveBytes   int64
 }
+
+// MetadataIssue records directory metadata that could not be restored after
+// all content had been extracted.
+type MetadataIssue struct {
+	Path      string
+	Operation string
+	Err       error
+}
+
+// Variables make the two best-effort directory metadata operations available
+// to deterministic failure-injection tests. File metadata deliberately uses
+// os directly because a file metadata failure must remain immediately fatal.
+var (
+	chmodDirectory   = os.Chmod
+	chtimesDirectory = os.Chtimes
+)
 
 // Extract writes a tar stream into opts.Dest.
 //
@@ -70,6 +94,7 @@ func Extract(ctx context.Context, r io.Reader, opts ExtractOptions) (ExtractStat
 	// creating a file updates its parent's mtime.
 	type pending struct {
 		path    string
+		archive string
 		mode    fs.FileMode
 		modTime time.Time
 	}
@@ -96,8 +121,40 @@ func Extract(ctx context.Context, r io.Reader, opts ExtractOptions) (ExtractStat
 			return stats, fmt.Errorf("refusing to restore %q: %w", clean, err)
 		}
 
+		var archived FileInfo
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			archived = FileInfo{Path: clean, Kind: KindDir, Mode: hdr.FileInfo().Mode(), ModTime: hdr.ModTime}
+			stats.ArchiveDirs++
+		case tar.TypeReg:
+			archived = FileInfo{Path: clean, Kind: KindFile, Size: hdr.Size, Mode: hdr.FileInfo().Mode(), ModTime: hdr.ModTime}
+			stats.ArchiveFiles++
+			stats.ArchiveBytes += hdr.Size
+		default:
+			return stats, fmt.Errorf("refusing to restore %q: unsupported entry type %q", clean, hdr.Typeflag)
+		}
+		if opts.OnArchiveEntry != nil {
+			if err := opts.OnArchiveEntry(archived); err != nil {
+				return stats, err
+			}
+		}
+
 		if opts.Include != nil && !opts.Include(clean) {
 			stats.Skipped++
+			if hdr.Typeflag == tar.TypeReg {
+				digest := sha256.New()
+				n, err := io.Copy(digest, tr)
+				if err != nil {
+					return stats, fmt.Errorf("reading excluded file %q: %w", clean, err)
+				}
+				archived.Size = n
+				archived.SHA256 = hex.EncodeToString(digest.Sum(nil))
+				if opts.OnArchiveFile != nil {
+					if err := opts.OnArchiveFile(archived); err != nil {
+						return stats, err
+					}
+				}
+			}
 			continue
 		}
 
@@ -106,7 +163,7 @@ func Extract(ctx context.Context, r io.Reader, opts ExtractOptions) (ExtractStat
 			if err := os.MkdirAll(target, 0o755); err != nil {
 				return stats, err
 			}
-			dirs = append(dirs, pending{target, hdr.FileInfo().Mode(), hdr.ModTime})
+			dirs = append(dirs, pending{target, clean, hdr.FileInfo().Mode(), hdr.ModTime})
 			stats.Dirs++
 			opts.entry(FileInfo{Path: clean, Kind: KindDir, Mode: hdr.FileInfo().Mode(), ModTime: hdr.ModTime})
 
@@ -116,48 +173,35 @@ func Extract(ctx context.Context, r io.Reader, opts ExtractOptions) (ExtractStat
 				return stats, err
 			}
 			info.Path = clean
+			if opts.OnArchiveFile != nil {
+				if err := opts.OnArchiveFile(info); err != nil {
+					return stats, err
+				}
+			}
 			stats.Files++
 			stats.Bytes += info.Size
 			opts.entry(info)
 
-		case tar.TypeSymlink:
-			if !opts.AllowSymlinks {
-				stats.Skipped++
-				opts.warn(clean, "symlink skipped; restore with symlinks enabled to include it")
-				continue
-			}
-			// The link is checked at its position under the destination, which
-			// is what decides whether following it leaves that root.
-			if err := CheckLink(clean, hdr.Linkname); err != nil {
-				return stats, fmt.Errorf("refusing to restore %q: %w", clean, err)
-			}
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-				return stats, err
-			}
-			if opts.Overwrite {
-				os.Remove(target)
-			}
-			if err := os.Symlink(filepath.FromSlash(hdr.Linkname), target); err != nil {
-				return stats, fmt.Errorf("%s: %w", clean, err)
-			}
-			stats.Symlinks++
-			opts.entry(FileInfo{Path: clean, Kind: KindSymlink, Link: hdr.Linkname, ModTime: hdr.ModTime})
-
-		default:
-			// Hard links, devices, fifos and sockets are not produced by
-			// BOND's writer. Meeting one means the stream is not what it
-			// claims to be.
-			return stats, fmt.Errorf("refusing to restore %q: unsupported entry type %q", clean, hdr.Typeflag)
 		}
 	}
 
+	// Both operations are attempted and reported separately: the restore is
+	// marked incomplete rather than passing silently, which is the whole point.
+	//
+	// There is deliberately no "the archive recorded no value" guard. It reads
+	// like one is needed and it would be dead code: a tar directory header
+	// always carries ModeDir, so Mode is never zero, and a tar mtime round-trips
+	// through a Unix timestamp, so an unset one comes back as the epoch rather
+	// than the zero Time. Both guards existed here once and neither ever fired.
 	sort.Slice(dirs, func(i, j int) bool { return len(dirs[i].path) > len(dirs[j].path) })
 	for _, d := range dirs {
-		if d.mode != 0 {
-			os.Chmod(d.path, d.mode.Perm())
+		if err := chmodDirectory(d.path, d.mode.Perm()); err != nil {
+			stats.MetadataIssues = append(stats.MetadataIssues, MetadataIssue{Path: d.archive, Operation: "permissions", Err: err})
+			opts.warn(d.archive, "directory permissions were not restored: "+err.Error())
 		}
-		if !d.modTime.IsZero() {
-			os.Chtimes(d.path, d.modTime, d.modTime)
+		if err := chtimesDirectory(d.path, d.modTime, d.modTime); err != nil {
+			stats.MetadataIssues = append(stats.MetadataIssues, MetadataIssue{Path: d.archive, Operation: "timestamps", Err: err})
+			opts.warn(d.archive, "directory timestamps were not restored: "+err.Error())
 		}
 	}
 	return stats, nil

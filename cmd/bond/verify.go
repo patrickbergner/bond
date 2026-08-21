@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"time"
 
 	"github.com/patrickbergner/bond/internal/backup"
@@ -132,21 +131,7 @@ func quickVerify(path string) error {
 // volumeFiles lists the files a container is stored in, without opening any of
 // them as a container.
 func volumeFiles(path string) ([]string, error) {
-	if _, err := os.Stat(path); err == nil {
-		if numbered, _ := filepath.Glob(container.VolumeBase(path) + ".[0-9][0-9][0-9]"); len(numbered) > 1 {
-			sort.Strings(numbered)
-			return numbered, nil
-		}
-		return []string{path}, nil
-	}
-	// A set written with splitting on is named .001 even when it needed only one
-	// file, so the name the operator knows it by may not exist on its own.
-	numbered, err := filepath.Glob(container.VolumeBase(path) + ".[0-9][0-9][0-9]")
-	if err != nil || len(numbered) == 0 {
-		return nil, fmt.Errorf("%s does not exist", path)
-	}
-	sort.Strings(numbered)
-	return numbered, nil
+	return container.VolumeFiles(path)
 }
 
 func runInspect(args []string) error {
@@ -206,9 +191,24 @@ options:
 			fmt.Printf("    %-15s%s\n", s.Type, label)
 		}
 	}
-	if sb.Flags&format.FlagUnencrypted != 0 {
+	// The slots decide this, not the header flag. A NONE container whose
+	// plaintext slot was later removed still carries the flag – the header is
+	// never rewritten by a key change – and saying "the key is stored in this
+	// container" about one that no longer stores it is the worst direction to
+	// be wrong in. The flag is reported only where it contradicts the slots.
+	plaintext := r.HasPlaintextSlot()
+	if plaintext {
 		fmt.Printf("\n  encryption        NONE – the key is stored in this container.\n")
-		fmt.Printf("                    It is authenticated end to end, but anyone holding it can read it.\n")
+		fmt.Printf("                    Tags detect corruption, but provide no authenticity against an attacker.\n")
+	}
+	switch flagged := sb.Flags&format.FlagUnencrypted != 0; {
+	case flagged && !plaintext:
+		fmt.Printf("\n  encryption        the header still carries the unencrypted flag from when this\n")
+		fmt.Printf("                    container was written; its plaintext slot has since been removed,\n")
+		fmt.Printf("                    so the slots above are what actually opens it. \"bond rekey\" writes\n")
+		fmt.Printf("                    a fresh container whose header matches its keys.\n")
+	case !flagged && plaintext:
+		fmt.Printf("                    The header does not carry the unencrypted flag. Believe the slot.\n")
 	}
 
 	secrets, err := keys.unlockersFor(r.Slots())
@@ -216,7 +216,11 @@ options:
 		fmt.Printf("\nwith a key\n  not shown: %v\n", err)
 		return nil
 	}
-	if err := r.Unlock(secrets...); err != nil {
+	defer wipeUnlockers(secrets)
+	if keys.allowExpensiveKDF {
+		fmt.Fprintln(os.Stderr, "warning: --allow-expensive-kdf permits unauthenticated container data to request extreme memory or CPU")
+	}
+	if err := r.UnlockWithOptions(keys.unlockOptions(), secrets...); err != nil {
 		return err
 	}
 
@@ -235,8 +239,8 @@ options:
 	fmt.Println()
 	fmt.Printf("  contents          %s, %s, %s\n",
 		ui.Items(m.Files, "file", "files"), ui.Items(m.Dirs, "directory", "directories"), ui.Bytes(m.Bytes))
-	if m.Symlinks > 0 {
-		fmt.Printf("                    %s\n", ui.Items(m.Symlinks, "symlink", "symlinks"))
+	if m.SkippedSymlinks > 0 {
+		fmt.Printf("  symlinks skipped  %s\n", ui.Items(m.SkippedSymlinks, "symlink", "symlinks"))
 	}
 	fmt.Printf("  compressed to     %s\n", ui.Bytes(m.StreamLength))
 	fmt.Printf("  file index        %s\n", indexState(m))

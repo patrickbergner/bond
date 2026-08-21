@@ -142,7 +142,7 @@ func Defaults() Resolved {
 		MaxVolumeBytes:   0,
 		HashAlgorithm:    HashSHA384,
 		StoreFileIndex:   true,
-		FollowSymlinks:   false,
+		FollowSymlinks:   true,
 		OutputPath:       "{{TOOL_DIR}}/output",
 		WorkPath:         "{{TOOL_DIR}}/work",
 	}

@@ -173,6 +173,7 @@ func createBackups(cfg *config.Config, targets []*config.Target, configPath, wor
 				return fmt.Errorf("%s could not be read; use --ignore-errors to back up what is readable anyway", path)
 			},
 		})
+		wipeKeySpecs(specs.slots)
 		progress.Clear()
 		if err != nil {
 			failures++
@@ -184,6 +185,12 @@ func createBackups(cfg *config.Config, targets []*config.Target, configPath, wor
 			ui.Items(result.Stats.Files, "file", "files"),
 			ui.Items(result.Stats.Dirs, "directory", "directories"),
 			ui.Bytes(result.Stats.Bytes))
+		// A backup that left links out must say so in its summary, not only in
+		// per-path warnings that scroll away. "It looked complete" is how a
+		// missing subtree survives until the restore that needed it.
+		if result.Stats.SkippedSymlinks > 0 {
+			fmt.Printf("  links skipped %s\n", ui.Items(result.Stats.SkippedSymlinks, "symlink", "symlinks"))
+		}
 		fmt.Printf("  written       %s\n", result.Path)
 		fmt.Printf("                %s", ui.Bytes(result.Size))
 		if result.Stats.Bytes > 0 {
@@ -223,6 +230,16 @@ func createBackups(cfg *config.Config, targets []*config.Target, configPath, wor
 type keySpecs struct {
 	slots       []container.KeySpec
 	unencrypted bool
+}
+
+func wipeKeySpecs(specs []container.KeySpec) {
+	unlockers := make([]crypto.Unlocker, 0, len(specs))
+	for _, spec := range specs {
+		if spec.Secret != nil {
+			unlockers = append(unlockers, spec.Secret)
+		}
+	}
+	wipeUnlockers(unlockers)
 }
 
 func keySpecsFor(keys *keyFlags, settings config.Resolved) (*keySpecs, error) {
@@ -291,6 +308,9 @@ func dryRunBackup(cfg *config.Config, targets []*config.Target, configPath, work
 
 		walker := &source.Walker{
 			FollowSymlinks: settings.FollowSymlinks,
+			OnWarning: func(path, msg string) {
+				fmt.Printf("    ! %s: %s\n", path, msg)
+			},
 			OnProblem: func(abs string, err error) error {
 				problems++
 				fmt.Printf("    ! %s: %v\n", abs, err)
@@ -318,8 +338,8 @@ func dryRunBackup(cfg *config.Config, targets []*config.Target, configPath, work
 			ui.Items(stats.Files, "file", "files"),
 			ui.Items(stats.Dirs, "directory", "directories"),
 			ui.Bytes(stats.Bytes))
-		if stats.Symlinks > 0 {
-			fmt.Printf("                %s\n", ui.Items(stats.Symlinks, "symlink", "symlinks"))
+		if stats.SkippedSymlinks > 0 {
+			fmt.Printf("  links skipped %s\n", ui.Items(stats.SkippedSymlinks, "symlink", "symlinks"))
 		}
 		if stats.ExcludedFiles > 0 || stats.ExcludedDirs > 0 {
 			fmt.Printf("  filtered out  %s, %s\n",

@@ -111,8 +111,17 @@ func (p *RecipientPrivate) Public() *RecipientPublic {
 // Seed is the secret this recipient was derived from.
 func (p *RecipientPrivate) Seed() []byte { return p.seed }
 
-// Wipe clears the seed.
-func (p *RecipientPrivate) Wipe() { Wipe(p.seed) }
+// Wipe clears the seed and releases expanded private-key references promptly.
+// The opaque standard-library key objects cannot be overwritten in place.
+func (p *RecipientPrivate) Wipe() {
+	if p == nil {
+		return
+	}
+	Wipe(p.seed)
+	p.seed = nil
+	p.X25519 = nil
+	p.MLKEM = nil
+}
 
 // Bytes renders a public key as X25519 ‖ ML-KEM.
 func (p *RecipientPublic) Bytes() []byte {

@@ -2,6 +2,7 @@ package backup
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"runtime"
@@ -17,10 +18,9 @@ import (
 type RestoreOptions struct {
 	Dest string
 
-	Include       func(archivePath string) bool
-	AllowSymlinks bool
-	Overwrite     bool
-	Tool          *sevenzip.Tool
+	Include   func(archivePath string) bool
+	Overwrite bool
+	Tool      *sevenzip.Tool
 
 	OnEntry   func(archive.FileInfo)
 	OnWarning func(path, msg string)
@@ -33,6 +33,20 @@ type RestoreResult struct {
 	Verified int
 	Mismatch []string
 }
+
+// ErrIncompleteRestore identifies a restore whose file data completed but
+// whose directory metadata could not be reproduced exactly.
+var ErrIncompleteRestore = errors.New("restore completed with metadata omissions")
+
+type IncompleteRestoreError struct {
+	Issues []archive.MetadataIssue
+}
+
+func (e *IncompleteRestoreError) Error() string {
+	return fmt.Sprintf("%d directory metadata operations failed; restored data is present but the restore is incomplete", len(e.Issues))
+}
+
+func (e *IncompleteRestoreError) Unwrap() error { return ErrIncompleteRestore }
 
 // Restore writes a container's contents to disk.
 //
@@ -57,7 +71,8 @@ func Restore(ctx context.Context, r *container.Reader, opts RestoreOptions) (*Re
 
 	source := stream
 	var closer io.Closer
-	if r.Manifest().Compression.Format == "xz" {
+	switch r.Manifest().Compression.Format {
+	case "xz":
 		if opts.Tool == nil {
 			return nil, fmt.Errorf("this container is compressed but no 7-Zip is available")
 		}
@@ -66,6 +81,10 @@ func Restore(ctx context.Context, r *container.Reader, opts RestoreOptions) (*Re
 			return nil, err
 		}
 		source, closer = decompressor, decompressor
+	case "none":
+		// The authenticated manifest says the stream is raw tar.
+	default:
+		return nil, fmt.Errorf("unsupported compression format %q", r.Manifest().Compression.Format)
 	}
 
 	if err := checkCaseCollisions(r.Manifest().Index); err != nil {
@@ -82,22 +101,52 @@ func Restore(ctx context.Context, r *container.Reader, opts RestoreOptions) (*Re
 	}
 
 	result := &RestoreResult{}
+	indexPosition := 0
 	stats, err := archive.Extract(ctx, source, archive.ExtractOptions{
-		Dest:          opts.Dest,
-		Include:       opts.Include,
-		AllowSymlinks: opts.AllowSymlinks,
-		Overwrite:     opts.Overwrite,
-		OnWarning:     opts.OnWarning,
+		Dest:      opts.Dest,
+		Include:   opts.Include,
+		Overwrite: opts.Overwrite,
+		OnWarning: opts.OnWarning,
+		OnArchiveEntry: func(actual archive.FileInfo) error {
+			if !r.Manifest().IndexStored {
+				return nil
+			}
+			if indexPosition >= len(r.Manifest().Index) {
+				return fmt.Errorf("archive contains unexpected entry %q beyond the manifest index", actual.Path)
+			}
+			expected := r.Manifest().Index[indexPosition]
+			indexPosition++
+			if actual.Path != expected.Path || actual.Kind != expected.Kind || actual.Size != expected.Size ||
+				actual.Mode.Perm() != expected.Mode.Perm() || !actual.ModTime.Equal(expected.ModTime) {
+				return fmt.Errorf("archive entry %q does not match manifest index entry %q", actual.Path, expected.Path)
+			}
+			return nil
+		},
+		// Every file in the stream is hashed, including the ones a partial
+		// restore excludes: a container is one sealed object and checking only
+		// the slice asked for would leave the rest unexamined. A mismatch
+		// anywhere is worth reporting.
+		//
+		// Verified counts only what was written, though. It is printed as
+		// "N files match the digests recorded at backup time", and a file that
+		// was never restored has nothing on disk to match.
+		OnArchiveFile: func(fi archive.FileInfo) error {
+			expected, ok := want[fi.Path]
+			if !ok {
+				return nil
+			}
+			if expected != fi.SHA256 {
+				result.Mismatch = append(result.Mismatch, fi.Path)
+				return nil
+			}
+			if opts.Include == nil || opts.Include(fi.Path) {
+				result.Verified++
+			}
+			return nil
+		},
 		OnEntry: func(fi archive.FileInfo) {
 			if opts.OnEntry != nil {
 				opts.OnEntry(fi)
-			}
-			if expected, ok := want[fi.Path]; ok && fi.Kind == archive.KindFile {
-				if expected == fi.SHA256 {
-					result.Verified++
-				} else {
-					result.Mismatch = append(result.Mismatch, fi.Path)
-				}
 			}
 		},
 	})
@@ -115,9 +164,20 @@ func Restore(ctx context.Context, r *container.Reader, opts RestoreOptions) (*Re
 
 	result.Stats = stats
 	result.Elapsed = time.Since(started)
+	if r.Manifest().IndexStored && indexPosition != len(r.Manifest().Index) {
+		return result, fmt.Errorf("archive ended after %d entries, manifest index records %d", indexPosition, len(r.Manifest().Index))
+	}
+	if !r.Manifest().IndexStored && (stats.ArchiveFiles != r.Manifest().Files || stats.ArchiveDirs != r.Manifest().Dirs || stats.ArchiveBytes != r.Manifest().Bytes) {
+		return result, fmt.Errorf("archive totals are %d files, %d directories and %d bytes; manifest records %d, %d and %d",
+			stats.ArchiveFiles, stats.ArchiveDirs, stats.ArchiveBytes,
+			r.Manifest().Files, r.Manifest().Dirs, r.Manifest().Bytes)
+	}
 	if len(result.Mismatch) > 0 {
 		return result, fmt.Errorf("%d restored files do not match the digests recorded when they were backed up: %s",
 			len(result.Mismatch), strings.Join(truncate(result.Mismatch, 5), ", "))
+	}
+	if len(stats.MetadataIssues) > 0 {
+		return result, &IncompleteRestoreError{Issues: stats.MetadataIssues}
 	}
 	return result, nil
 }
@@ -170,7 +230,7 @@ func ListEntries(r *container.Reader) ([]archive.FileInfo, error) {
 		return nil, fmt.Errorf("the container is locked")
 	}
 	m := r.Manifest()
-	if len(m.Index) == 0 && m.Files > 0 {
+	if !m.IndexStored {
 		return nil, fmt.Errorf("this container was written without a file index (storeFileIndex was off); restore it to see what is inside")
 	}
 	return m.Index, nil

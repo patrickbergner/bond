@@ -15,12 +15,13 @@ import (
 // keyFlags collects the ways a secret can reach BOND. They are shared by every
 // command that opens or creates a container.
 type keyFlags struct {
-	passphrase     string
-	passphraseFile string
-	passphraseEnv  string
-	keyfile        string
-	recoveryKey    string
-	recoveryFile   string
+	passphrase        string
+	passphraseFile    string
+	passphraseEnv     string
+	keyfile           string
+	recoveryKey       string
+	recoveryFile      string
+	allowExpensiveKDF bool
 }
 
 func (k *keyFlags) register(fs *flag.FlagSet) {
@@ -30,6 +31,7 @@ func (k *keyFlags) register(fs *flag.FlagSet) {
 	fs.StringVar(&k.keyfile, "keyfile", "", "32-byte key file to unlock with")
 	fs.StringVar(&k.recoveryKey, "recovery-key", "", "printed recovery key, as written on the card")
 	fs.StringVar(&k.recoveryFile, "recovery-key-file", "", "read the recovery key from a file")
+	fs.BoolVar(&k.allowExpensiveKDF, "allow-expensive-kdf", false, "allow Argon2 costs above the local safety policy")
 }
 
 const keyFlagHelp = `  -p, --passphrase <text>        passphrase on the command line (discouraged)
@@ -37,7 +39,8 @@ const keyFlagHelp = `  -p, --passphrase <text>        passphrase on the command 
       --passphrase-env <name>    read the passphrase from an environment variable
       --keyfile <path>           32-byte key file
       --recovery-key <text>      printed recovery key (BOND-R1-...)
-      --recovery-key-file <path> read the recovery key from a file`
+      --recovery-key-file <path> read the recovery key from a file
+      --allow-expensive-kdf      allow unusually costly Argon2 slots (resource risk)`
 
 // registerShorthand adds the single-letter aliases, kept separate so the long
 // forms stay the ones documented.
@@ -66,6 +69,7 @@ func (k *keyFlags) readPassphrase(prompt string, confirm bool) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("reading the passphrase file: %w", err)
 		}
+		defer crypto.Wipe(data)
 		line, _, _ := strings.Cut(string(data), "\n")
 		line = strings.TrimRight(line, "\r")
 		if line == "" {
@@ -94,6 +98,7 @@ func (k *keyFlags) readKeyfile() ([]byte, error) {
 		return nil, fmt.Errorf("reading the key file: %w", err)
 	}
 	if len(data) != crypto.KeyLen {
+		crypto.Wipe(data)
 		return nil, fmt.Errorf("%s is %d bytes; a key file is exactly %d", k.keyfile, len(data), crypto.KeyLen)
 	}
 	return data, nil
@@ -112,6 +117,7 @@ func (k *keyFlags) readRecovery() (*crypto.RecipientPrivate, error) {
 		if err != nil {
 			return nil, fmt.Errorf("reading the recovery key: %w", err)
 		}
+		defer crypto.Wipe(data)
 		found, err := findRecoveryKey(string(data))
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", k.recoveryFile, err)
@@ -155,6 +161,12 @@ func (k *keyFlags) unlockersFor(slots []*crypto.Slot) ([]crypto.Unlocker, error)
 	}
 
 	var out []crypto.Unlocker
+	success := false
+	defer func() {
+		if !success {
+			wipeUnlockers(out)
+		}
+	}()
 	if kinds[crypto.SlotPlaintext] {
 		// An unencrypted container needs nothing from anyone.
 		out = append(out, crypto.PlaintextSecret{})
@@ -193,7 +205,29 @@ func (k *keyFlags) unlockersFor(slots []*crypto.Slot) ([]crypto.Unlocker, error)
 	if len(out) == 0 {
 		return nil, fmt.Errorf("no key was given for a container that opens with %s", listKinds(slots))
 	}
+	success = true
 	return out, nil
+}
+
+func (k *keyFlags) unlockOptions() container.UnlockOptions {
+	policy := crypto.DefaultKDFPolicy
+	policy.AllowExpensive = k.allowExpensiveKDF
+	return container.UnlockOptions{KDFPolicy: policy}
+}
+
+func wipeUnlockers(unlockers []crypto.Unlocker) {
+	for _, unlocker := range unlockers {
+		switch secret := unlocker.(type) {
+		case crypto.Passphrase:
+			crypto.Wipe(secret)
+		case crypto.KeyfileSecret:
+			crypto.Wipe(secret)
+		case crypto.RecipientSecret:
+			if secret.Private != nil {
+				secret.Private.Wipe()
+			}
+		}
+	}
 }
 
 // wrongKind explains that the secret offered is not one this container takes,
@@ -232,6 +266,12 @@ func (k *keyFlags) createSpecs(settings config.Resolved, kdf crypto.KDFParams) (
 		specs       []container.KeySpec
 		unencrypted bool
 	)
+	success := false
+	defer func() {
+		if !success {
+			wipeKeySpecs(specs)
+		}
+	}()
 
 	switch settings.EncryptionMethod {
 	case config.EncryptionNone:
@@ -276,6 +316,7 @@ func (k *keyFlags) createSpecs(settings config.Resolved, kdf crypto.KDFParams) (
 				return nil, false, fmt.Errorf("reading the key file for slot %q: %w", slot.Label, err)
 			}
 			if len(data) != crypto.KeyLen {
+				crypto.Wipe(data)
 				return nil, false, fmt.Errorf("%s is %d bytes; a key file is exactly %d", slot.Path, len(data), crypto.KeyLen)
 			}
 			specs = append(specs, container.KeySpec{
@@ -301,6 +342,7 @@ func (k *keyFlags) createSpecs(settings config.Resolved, kdf crypto.KDFParams) (
 	if len(specs) == 0 {
 		return nil, false, fmt.Errorf("no key slots would be created; the container would be unopenable")
 	}
+	success = true
 	return specs, unencrypted, nil
 }
 

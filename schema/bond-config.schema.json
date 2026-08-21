@@ -150,8 +150,8 @@
         },
         "followSymlinks": {
           "type": "boolean",
-          "default": false,
-          "description": "Store what a symlink points at instead of the link itself."
+          "default": true,
+          "description": "Materialize symlink targets as ordinary files/directories. When false, included symlinks are counted, warned about and omitted."
         },
         "outputPath": {
           "type": "string",

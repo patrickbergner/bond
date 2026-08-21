@@ -2,7 +2,6 @@ package archive
 
 import (
 	"fmt"
-	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -13,10 +12,9 @@ import (
 // directory. Everything below treats an archive name as untrusted input and
 // decides, before a single byte is written, whether it may exist at all.
 //
-// The rule is absolute: a restore writes inside its destination or it fails.
-// There is no sanitising fallback that quietly renames an unacceptable path,
-// because a backup silently restoring to the wrong place is worse than one
-// that stops and says why.
+// The rule is lexical: an archive name must be below the selected destination.
+// Existing filesystem redirections retain ordinary operating-system behavior.
+// There is no sanitising fallback that quietly renames an unacceptable path.
 
 // windowsReserved are device names MS-DOS still reserves. Creating one on
 // Windows opens a device rather than a file.
@@ -31,8 +29,27 @@ var windowsReserved = map[string]bool{
 // CheckName rejects any archive name a restore must not act on. It is
 // deliberately independent of the destination and of the filesystem, so it can
 // be run over a whole index before anything is created.
+//
+// It is a *restore* policy, not a format rule, because half of it depends on
+// where the restore is happening: `com1` and `a:b` are ordinary names on POSIX
+// and unusable on Windows. Nothing that decides whether a container can be
+// opened may call this – see CheckPortableName.
 func CheckName(name string) error {
 	return checkName(name, runtime.GOOS == "windows")
+}
+
+// CheckPortableName applies only the rules that hold on every platform: a name
+// that fails here is malformed wherever it is read.
+//
+// The distinction earns its keep in Manifest.Validate. Validating an index with
+// CheckName would make a container's *openability* depend on the reader's
+// operating system: a backup written on Linux containing `com1` would fail to
+// unlock on Windows, so inspect, verify and list would all report the manifest
+// as invalid rather than the one entry as unrestorable. A name Windows cannot
+// create is a thing to refuse when creating it, which SafeJoin does, one entry
+// at a time, with a message that names it.
+func CheckPortableName(name string) error {
+	return checkName(name, false)
 }
 
 func checkName(name string, windows bool) error {
@@ -100,47 +117,4 @@ func SafeJoin(dest, name string) (string, error) {
 		return "", fmt.Errorf("path escapes the destination")
 	}
 	return full, nil
-}
-
-// CheckLink rejects a symlink whose target would point outside the
-// destination. linkPath is the archive name of the link itself; target is what
-// it points at, as stored.
-//
-// The check is lexical on purpose. Resolving through the filesystem would
-// depend on what happens to exist at restore time, and an attacker who can
-// choose both a link and its target can otherwise walk a restore out of its
-// directory one component at a time.
-func CheckLink(linkPath, target string) error {
-	if target == "" {
-		return fmt.Errorf("empty symlink target")
-	}
-
-	// Backslash is a separator on Windows and an ordinary character on POSIX,
-	// and the target is normalised before anything is decided about it. Doing
-	// this the other way round is a hole: on Windows a target of `\..` is
-	// rooted at the current drive, and normalising it *after* the absolute
-	// check turns it into "/.." – which path.Join then cleans to "/", quietly
-	// absorbing the very component that made it dangerous.
-	//
-	// The rule is applied on every platform, not only on Windows. A container
-	// travels, and a target that escapes on one system is not something to
-	// restore faithfully on another.
-	t := strings.ReplaceAll(target, `\`, "/")
-
-	if strings.HasPrefix(t, "/") {
-		return fmt.Errorf("symlink target %q is absolute", target)
-	}
-	if len(t) >= 2 && t[1] == ':' {
-		return fmt.Errorf("symlink target %q names a drive", target)
-	}
-
-	dir := path.Dir(strings.TrimSuffix(linkPath, "/"))
-	if dir == "." {
-		dir = ""
-	}
-	resolved := path.Join(dir, t)
-	if resolved == ".." || strings.HasPrefix(resolved, "../") {
-		return fmt.Errorf("symlink target %q points outside the destination", target)
-	}
-	return nil
 }

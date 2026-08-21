@@ -41,8 +41,6 @@ func (w *Writer) Add(e Entry) error {
 	switch e.Kind {
 	case KindDir:
 		return w.addDir(e)
-	case KindSymlink:
-		return w.addSymlink(e)
 	default:
 		return w.addFile(e)
 	}
@@ -63,22 +61,6 @@ func (w *Writer) addDir(e Entry) error {
 	return nil
 }
 
-func (w *Writer) addSymlink(e Entry) error {
-	hdr := &tar.Header{
-		Typeflag: tar.TypeSymlink,
-		Name:     e.Path,
-		Linkname: e.Link,
-		Mode:     int64(e.Mode.Perm()),
-		ModTime:  e.ModTime,
-		Format:   tar.FormatPAX,
-	}
-	if err := w.tw.WriteHeader(hdr); err != nil {
-		return fmt.Errorf("%s: %w", e.Path, err)
-	}
-	w.index = append(w.index, FileInfo{Path: e.Path, Kind: KindSymlink, Mode: e.Mode, ModTime: e.ModTime, Link: e.Link})
-	return nil
-}
-
 func (w *Writer) addFile(e Entry) error {
 	f, err := os.Open(e.Disk)
 	if err != nil {
@@ -93,6 +75,9 @@ func (w *Writer) addFile(e Entry) error {
 	info, err := f.Stat()
 	if err != nil {
 		return fmt.Errorf("%s: %w", e.Path, err)
+	}
+	if e.Expected != nil && !os.SameFile(e.Expected, info) {
+		return fmt.Errorf("%s changed identity between enumeration and opening; refusing to archive a substituted path", e.Path)
 	}
 	return w.writeRegular(e.Path, f, info.Size(), info.Mode(), info.ModTime())
 }

@@ -220,3 +220,36 @@ step "a name the filesystem would silently rename is never written under the ren
 if [ -d "$CASE_TMP/restored-partial" ]; then
     assert_missing "$CASE_TMP/restored-partial/partly-readable/trailing space"
 fi
+
+# ---------------------------------------------------------------------------
+# Refusals that protect a backup that already exists
+
+step "removing the plaintext slot of a NONE container is refused, because it does not encrypt anything"
+# The tempting reading of "remove the plaintext slot" is "encrypt this backup
+# now". It is not: the master key was in the file when it was written, so every
+# copy taken before today still opens. Doing it would also leave the header
+# advertising NONE for a container that no longer has a plaintext slot, because
+# a key change rewrites the slot table and never the header.
+plain_out="$CASE_TMP/output-plaintext"
+config_new "$plain_out" "$work"
+config_setting '"encryptionMethod": "NONE"'
+config_target plain "$src"
+config_write "$cfg"
+bond_ok backup --config "$cfg"
+plain="$(container_in "$plain_out")"
+
+bond_with_stdin "second key" keys add "$plain" --new-passphrase --label "added later"
+[ "$BOND_STATUS" -eq 0 ] || fail "adding a passphrase slot to a NONE container exited $BOND_STATUS"
+
+bond_fail keys remove "$plain" --slot 0 --yes
+expect_err "bond rekey"
+
+step "and the container still opens afterwards"
+bond_ok verify "$plain"
+expect_out "OK"
+
+# Publishing over an occupied namespace is not driven from here. Container
+# names carry a timestamp, so a second run never lands on the first one's name,
+# and manufacturing the collision would mean predicting that timestamp. The
+# refusal and the message that names every file in the way are proved in
+# internal/container's publication tests instead.

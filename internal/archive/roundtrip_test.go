@@ -6,10 +6,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -122,6 +122,69 @@ func TestExtractPreservesModTime(t *testing.T) {
 	}
 }
 
+func TestExtractReportsAllDirectoryMetadataFailures(t *testing.T) {
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	stamp := time.Date(2022, 6, 7, 8, 9, 10, 0, time.UTC)
+	if err := tw.WriteHeader(&tar.Header{Name: "dir/", Typeflag: tar.TypeDir, Mode: 0o750, ModTime: stamp}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: "dir/file", Typeflag: tar.TypeReg, Mode: 0o640, Size: 2, ModTime: stamp}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write([]byte("ok")); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	originalChmod, originalChtimes := chmodDirectory, chtimesDirectory
+	chmodDirectory = func(string, os.FileMode) error { return errors.New("injected chmod failure") }
+	chtimesDirectory = func(string, time.Time, time.Time) error { return errors.New("injected chtimes failure") }
+	t.Cleanup(func() {
+		chmodDirectory, chtimesDirectory = originalChmod, originalChtimes
+	})
+
+	var warnings []string
+	stats, err := Extract(context.Background(), bytes.NewReader(buf.Bytes()), ExtractOptions{
+		Dest: t.TempDir(),
+		OnWarning: func(path, message string) {
+			warnings = append(warnings, path+": "+message)
+		},
+	})
+	if err != nil {
+		t.Fatalf("Extract returned a fatal error: %v", err)
+	}
+	if stats.Files != 1 || len(stats.MetadataIssues) != 2 || len(warnings) != 2 {
+		t.Fatalf("stats = %+v, warnings = %q; want data restored and both metadata failures reported", stats, warnings)
+	}
+}
+
+// A directory header with nothing set still restores cleanly. It is worth
+// pinning down because the code reads as though it needs a "was anything
+// recorded?" guard: a tar directory always carries ModeDir and an unset mtime
+// comes back as the Unix epoch, so no such guard could ever fire, and adding one
+// on the zero values would be dead code that looks load-bearing.
+func TestBareDirectoryHeaderRestoresWithoutMetadataIssues(t *testing.T) {
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	if err := tw.WriteHeader(&tar.Header{Name: "bare/", Typeflag: tar.TypeDir}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := Extract(context.Background(), bytes.NewReader(buf.Bytes()), ExtractOptions{Dest: t.TempDir()})
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if stats.Dirs != 1 || len(stats.MetadataIssues) != 0 {
+		t.Errorf("stats = %+v, want one directory and no metadata issues", stats)
+	}
+}
+
 func TestExtractRefusesEscapingEntry(t *testing.T) {
 	// Hand-built: BOND's own writer cannot produce this, which is exactly why
 	// the reader has to be the thing that refuses it.
@@ -158,7 +221,36 @@ func TestExtractRefusesUnsupportedTypes(t *testing.T) {
 	}
 }
 
-func TestExtractSymlinkPolicy(t *testing.T) {
+func TestWriterRejectsSourceIdentitySubstitution(t *testing.T) {
+	dir := t.TempDir()
+	path := write(t, dir, "source.txt", "first")
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected, err := f.Stat()
+	f.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(path, filepath.Join(dir, "original.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("other"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	w := NewWriter(io.Discard)
+	err = w.Add(Entry{
+		Path: "source.txt", Disk: path, Kind: KindFile, Size: expected.Size(),
+		Mode: expected.Mode(), ModTime: expected.ModTime(), Expected: expected,
+	})
+	if err == nil || !strings.Contains(err.Error(), "changed identity") {
+		t.Fatalf("substituted source error = %v", err)
+	}
+}
+
+func TestExtractRejectsSymlinkEntries(t *testing.T) {
 	build := func(target string) *bytes.Buffer {
 		var buf bytes.Buffer
 		tw := tar.NewWriter(&buf)
@@ -167,36 +259,8 @@ func TestExtractSymlinkPolicy(t *testing.T) {
 		return &buf
 	}
 
-	// Off by default, and saying so rather than silently dropping it.
-	var skipped string
-	stats, err := Extract(context.Background(), build("file.txt"), ExtractOptions{
-		Dest:      t.TempDir(),
-		OnWarning: func(p, msg string) { skipped = p },
-	})
-	if err != nil {
-		t.Fatalf("Extract: %v", err)
-	}
-	if stats.Symlinks != 0 || stats.Skipped != 1 || skipped != "dir/link" {
-		t.Errorf("stats = %+v, skipped = %q; want the link skipped and reported", stats, skipped)
-	}
-
-	// Enabled, but a target that leaves the destination is still refused.
-	if _, err := Extract(context.Background(), build("../../../etc/passwd"), ExtractOptions{
-		Dest:          t.TempDir(),
-		AllowSymlinks: true,
-	}); err == nil {
-		t.Error("Extract accepted a symlink pointing outside the destination")
-	}
-
-	if runtime.GOOS == "windows" {
-		t.Skip("creating symlinks needs a privilege Windows does not grant by default")
-	}
-	dest := t.TempDir()
-	if _, err := Extract(context.Background(), build("file.txt"), ExtractOptions{Dest: dest, AllowSymlinks: true}); err != nil {
-		t.Fatalf("Extract with symlinks enabled: %v", err)
-	}
-	if _, err := os.Lstat(filepath.Join(dest, "dir", "link")); err != nil {
-		t.Errorf("the symlink was not restored: %v", err)
+	if _, err := Extract(context.Background(), build("file.txt"), ExtractOptions{Dest: t.TempDir()}); err == nil {
+		t.Error("Extract accepted a symlink entry")
 	}
 }
 

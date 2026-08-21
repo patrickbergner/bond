@@ -105,8 +105,15 @@ func Create(path string, opts Options) (*Writer, error) {
 	}
 	keys, err := crypto.Derive(fmk, uuid)
 	if err != nil {
+		crypto.Wipe(fmk)
 		return nil, err
 	}
+	keepKeys := false
+	defer func() {
+		if !keepKeys {
+			keys.Wipe()
+		}
+	}()
 
 	slots := make([]*crypto.Slot, 0, len(opts.Keys))
 	for i, spec := range opts.Keys {
@@ -178,6 +185,7 @@ func Create(path string, opts Options) (*Writer, error) {
 		w.sb.DataShards = uint32(plan.Data)
 		w.sb.ParityShards = uint32(plan.Parity)
 	}
+	keepKeys = true
 	return w, nil
 }
 
@@ -186,6 +194,20 @@ func (w *Writer) ContainerUUID() []byte { return w.sb.ContainerUUID }
 
 // Keys exposes the derived subkeys, for sealing the manifest.
 func (w *Writer) Keys() *crypto.Keys { return w.keys }
+
+// Validate authenticates the finished bytes through the reader path while the
+// writer still holds the generated keys.
+func (w *Writer) Validate(path string) error {
+	if !w.closed {
+		return fmt.Errorf("the container is not finished")
+	}
+	r, err := Open(path)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	return r.AuthenticateWithKeys(w.keys)
+}
 
 // Write accepts the compressed stream and seals it into shards.
 func (w *Writer) Write(p []byte) (int, error) {
@@ -315,6 +337,14 @@ func (w *Writer) Finish(m *format.Manifest) error {
 	m.ShardSize = w.shardSize
 	m.DataShardCount = int64(w.shardIndex)
 	m.RecoveryPercent = w.recovery
+	m.DataShards = int(w.sb.DataShards)
+	m.ParityShards = int(w.sb.ParityShards)
+	if m.Compression.Format == "" {
+		m.Compression = format.Compression{Format: "none", Solid: true}
+	}
+	if err := m.Validate(); err != nil {
+		return fmt.Errorf("validating the completed manifest: %w", err)
+	}
 
 	tail, err := format.SealManifest(m, w.sb.Cipher, w.keys.Manifest, w.sb.ContainerUUID)
 	if err != nil {
@@ -364,9 +394,9 @@ func (w *Writer) writeHead() error {
 	// a single flipped bit in table A would cost the whole container, with the
 	// space that should have saved it sitting right behind it, blank.
 	//
-	// Identical generations are not a problem for the alternating write. A key
-	// change picks the newest table that parses, which is A, and writes B at
-	// generation 2 – exactly as it would have done.
+	// Identical generations are byte-identical at creation. A key change
+	// authenticates both, selects A as the physical current copy, and writes B
+	// at generation 2.
 	table := &format.SlotTable{Generation: 1, Slots: w.slots}
 	a, err := table.Marshal(w.keys.Header)
 	if err != nil {
@@ -377,19 +407,27 @@ func (w *Writer) writeHead() error {
 
 // Abort closes and removes a half-written container.
 func (w *Writer) Abort() {
-	if w.closed {
-		return
-	}
 	w.closed = true
 	w.vols.Remove()
-	w.keys.Wipe()
+	w.Destroy()
+}
+
+// Destroy closes writer handles and releases in-memory key material. It is safe
+// to call repeatedly and does not remove a successfully published container.
+func (w *Writer) Destroy() {
+	if w.vols != nil {
+		_ = w.vols.Close()
+	}
+	if w.keys != nil {
+		w.keys.Wipe()
+		w.keys = nil
+	}
 }
 
 // Volumes is how many files the container was written to.
 func (w *Writer) Volumes() int { return w.vols.Count() }
 
-// Publish moves a finished container to its destination, replacing whatever is
-// there only once every volume is complete on disk.
+// Publish moves a finished container to an unused destination namespace.
 func (w *Writer) Publish(dst string) ([]string, error) {
 	if !w.closed {
 		return nil, fmt.Errorf("the container is not finished")

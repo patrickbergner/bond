@@ -178,6 +178,7 @@ func buildSlot(r *container.Reader, passphrase bool, keyfile, recipient, label s
 		if label == "" {
 			label = "passphrase"
 		}
+		defer crypto.Wipe(pass)
 		return crypto.NewSlot(sb.Cipher, sb.ContainerUUID, fmk, crypto.Passphrase(pass), crypto.DefaultKDF, label)
 
 	case keyfile != "":
@@ -188,6 +189,7 @@ func buildSlot(r *container.Reader, passphrase bool, keyfile, recipient, label s
 		if len(data) != crypto.KeyLen {
 			return nil, fmt.Errorf("%s is %d bytes; a key file is exactly %d", keyfile, len(data), crypto.KeyLen)
 		}
+		defer crypto.Wipe(data)
 		if label == "" {
 			label = filepath.Base(keyfile)
 		}
@@ -243,6 +245,17 @@ func runKeysRemove(args []string) error {
 	}
 	if len(slots) == 1 {
 		return fmt.Errorf("this is the only key slot; removing it would leave the container permanently unopenable")
+	}
+
+	// Removing the plaintext slot looks like "encrypt this backup now" and is
+	// not: every byte was written with a key stored in the file, and anyone who
+	// took a copy before today still holds it. The header would also keep
+	// advertising NONE, because a key change rewrites the slot table and never
+	// the header. Rekey is the operation that actually changes who can read it.
+	if slots[index].Type == crypto.SlotPlaintext {
+		return fmt.Errorf("this is the plaintext slot of an unencrypted container, and removing it does not make the container encrypted: "+
+			"the master key was stored in it when it was written, so anyone who already has a copy can still open it. "+
+			"Use: bond rekey %s --to <new file>", path)
 	}
 
 	// Removing the slot you are holding is a way to lock yourself out of a
@@ -310,6 +323,7 @@ func runKeysRotate(args []string) error {
 	if err != nil {
 		return err
 	}
+	defer crypto.Wipe(pass)
 	sb := r.Superblock()
 	replacement, err := crypto.NewSlot(sb.Cipher, sb.ContainerUUID, r.Keys().FMK(),
 		crypto.Passphrase(pass), crypto.DefaultKDF, slots[index].Label)
@@ -456,6 +470,7 @@ options:
 	if err != nil {
 		return err
 	}
+	defer crypto.Wipe(pass)
 	specs := []container.KeySpec{{Secret: crypto.Passphrase(pass), KDF: crypto.DefaultKDF, Label: "passphrase"}}
 
 	if workDir == "" {

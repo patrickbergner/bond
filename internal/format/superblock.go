@@ -216,9 +216,12 @@ func Unmarshal(b []byte) (*Superblock, error) {
 	if got := binary.LittleEndian.Uint32(b[offHeaderSize:]); got != SuperblockSize {
 		return nil, fmt.Errorf("header claims to be %d bytes, want %d", got, SuperblockSize)
 	}
-	if s.VersionMajor != VersionMajor {
-		return nil, fmt.Errorf("container format version %d.%d; this build understands %d.x",
-			s.VersionMajor, s.VersionMinor, VersionMajor)
+	if s.VersionMajor != VersionMajor || s.VersionMinor != VersionMinor {
+		return nil, fmt.Errorf("container format version %d.%d; this build understands %d.%d",
+			s.VersionMajor, s.VersionMinor, VersionMajor, VersionMinor)
+	}
+	if unknown := s.Flags &^ FlagUnencrypted; unknown != 0 {
+		return nil, fmt.Errorf("container uses unsupported feature flags %#x", unknown)
 	}
 	if err := s.checkBounds(); err != nil {
 		return nil, err
@@ -352,13 +355,9 @@ func (s *Superblock) PlaintextPerShard() uint64 { return uint64(s.ShardSize) - c
 // point. Re-marshalling renders the reserved region as zeros, so whatever is
 // really written there was covered by nothing at all – 3.8 KiB per header copy
 // that passed Open, Unlock and a full Verify without a notice, against a
-// document promising the opposite. It also means a later minor version can put
-// a field in that region and this build still authenticates the header; it
-// simply does not know what the field means.
-//
-// SlotTable.Verify gets away with the same re-marshal because a table that is
-// not canonical MACs differently and is refused. A superblock's padding is
-// never read back, so it does not.
+// document promising the opposite. Exact-byte authentication catches damage in
+// that region even though format 1.0 assigns it no semantics. Slot tables use
+// the same raw-byte rule for their unused padding.
 func (s *Superblock) signable() []byte {
 	b := s.Marshal()
 	if s.raw != nil {

@@ -3,6 +3,7 @@ package container
 import (
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -104,6 +105,55 @@ func (r *Reader) Manifest() *format.Manifest { return r.manifest }
 // Keys are the container's subkeys, available once unlocked.
 func (r *Reader) Keys() *crypto.Keys { return r.keys }
 
+// AuthenticateWithKeys performs a strict metadata readback without opening a
+// key slot. It is used by a writer that still holds the freshly generated keys,
+// including when every slot is recipient-only.
+func (r *Reader) AuthenticateWithKeys(keys *crypto.Keys) error {
+	if keys == nil {
+		return fmt.Errorf("no container keys were supplied")
+	}
+	for _, volume := range r.vols.vols {
+		if !volume.scan.twin {
+			return fmt.Errorf("%s does not contain two identical parseable header copies", filepath.Base(volume.path))
+		}
+		for _, copy := range volume.scan.copies {
+			if err := copy.sb.Verify(keys); err != nil {
+				return fmt.Errorf("%s %s: %w", filepath.Base(volume.path), copy.source, err)
+			}
+		}
+	}
+	if err := r.vols.verifyAll(keys); err != nil {
+		return err
+	}
+	if len(r.tables) != 2 {
+		return fmt.Errorf("both key-slot tables are required for a completed container")
+	}
+	for _, table := range r.tables {
+		if err := table.Table.Verify(keys.Header); err != nil {
+			return fmt.Errorf("key-slot table %c: %w", 'A'+table.Index, err)
+		}
+	}
+	if err := r.unencryptedDisagreement(); err != nil {
+		return err
+	}
+	r.keys = keys
+	defer func() { r.keys = nil }()
+	if err := r.readManifestStrict(); err != nil {
+		return err
+	}
+	return r.crossCheck()
+}
+
+// UnlockOptions control work that happens before container metadata can be
+// authenticated.
+type UnlockOptions struct {
+	KDFPolicy crypto.KDFPolicy
+
+	// OnKDFDerivation is called immediately before an admitted Argon2
+	// derivation. It is intended for diagnostics and resource-policy tests.
+	OnKDFDerivation func(crypto.KDFParams)
+}
+
 // Unlock tries each secret against each slot, then authenticates everything
 // the header claims.
 //
@@ -124,6 +174,11 @@ func (r *Reader) Keys() *crypto.Keys { return r.keys }
 // Four attempts at worst, and only ever more than one when something is
 // actually damaged.
 func (r *Reader) Unlock(secrets ...crypto.Unlocker) error {
+	return r.UnlockWithOptions(UnlockOptions{KDFPolicy: crypto.DefaultKDFPolicy}, secrets...)
+}
+
+// UnlockWithOptions is Unlock with an explicit local Argon2 resource policy.
+func (r *Reader) UnlockWithOptions(opts UnlockOptions, secrets ...crypto.Unlocker) error {
 	if r.unlocked {
 		return nil
 	}
@@ -131,16 +186,31 @@ func (r *Reader) Unlock(secrets ...crypto.Unlocker) error {
 		return errors.New("no key was offered")
 	}
 
+	if opts.KDFPolicy == (crypto.KDFPolicy{}) {
+		opts.KDFPolicy = crypto.DefaultKDFPolicy
+	}
+	budget := &unlockBudget{policy: opts.KDFPolicy, onDerivation: opts.OnKDFDerivation}
+	cache := make(map[[32]byte]unwrapResult)
+	defer func() {
+		for _, result := range cache {
+			crypto.Wipe(result.fmk)
+		}
+	}()
+
 	first := r.vols.First()
 	var firstErr error
+	var policyErr error
 	for h := range first.scan.copies {
 		first.use(h)
 		r.sb, r.sbSource = first.sb, first.source()
 
 		for t := range r.tables {
 			r.using = t
-			err := r.unlockWith(secrets)
+			err := r.unlockWith(secrets, budget, cache)
 			if err != nil {
+				if policyErr == nil && errors.Is(err, crypto.ErrKDFPolicy) {
+					policyErr = err
+				}
 				if firstErr == nil {
 					firstErr = err
 				}
@@ -157,7 +227,93 @@ func (r *Reader) Unlock(secrets ...crypto.Unlocker) error {
 	first.use(0)
 	r.sb, r.sbSource = first.sb, first.source()
 	r.using = 0
+	if policyErr != nil {
+		return policyErr
+	}
 	return firstErr
+}
+
+type unlockBudget struct {
+	policy       crypto.KDFPolicy
+	started      uint32
+	onDerivation func(crypto.KDFParams)
+}
+
+// admit decides whether one more Argon2 derivation may run. Only derivations
+// that actually start are counted: the cache in unlockWith means the four
+// header-copy × slot-table combinations cost one derivation, not four, so the
+// count reflects distinct work rather than how hard the reader had to look.
+func (b *unlockBudget) admit(p crypto.KDFParams) error {
+	if err := p.Check(b.policy); err != nil {
+		return err
+	}
+	if b.policy.AllowExpensive {
+		return nil
+	}
+	if b.started >= b.policy.MaxDerivations {
+		return fmt.Errorf("%w: this unlock has already run %d key derivations, the limit is %d",
+			crypto.ErrKDFPolicy, b.started, b.policy.MaxDerivations)
+	}
+	b.started++
+	return nil
+}
+
+func (b *unlockBudget) starting(p crypto.KDFParams) {
+	if b.onDerivation != nil {
+		b.onDerivation(p)
+	}
+}
+
+type unwrapResult struct {
+	fmk crypto.FMK
+	err error
+}
+
+func unwrapAttemptID(containerUUID []byte, slot *crypto.Slot, secretIndex int) [32]byte {
+	h := sha256.New()
+	h.Write(containerUUID)
+	h.Write([]byte{byte(slot.Type)})
+	h.Write(slot.UUID)
+	h.Write(slot.Nonce)
+	h.Write(slot.Wrapped)
+	h.Write(slot.Salt)
+	var numbers [20]byte
+	binary.LittleEndian.PutUint32(numbers[0:], slot.KDF.MemoryKiB)
+	binary.LittleEndian.PutUint32(numbers[4:], slot.KDF.Iterations)
+	binary.LittleEndian.PutUint32(numbers[8:], slot.KDF.Parallelism)
+	binary.LittleEndian.PutUint64(numbers[12:], uint64(secretIndex))
+	h.Write(numbers[:])
+	h.Write(slot.Encapsulation)
+	var out [32]byte
+	copy(out[:], h.Sum(nil))
+	return out
+}
+
+// HasPlaintextSlot reports whether the master key is stored inside the
+// container. It is the authoritative answer to "can anyone holding this file
+// read it": FlagUnencrypted in the header is advisory and can fall out of step
+// with the slots, because key changes rewrite the slot table and never the
+// header. Callers deciding what to tell an operator should ask this.
+func (r *Reader) HasPlaintextSlot() bool {
+	for _, slot := range r.Slots() {
+		if slot.Type == crypto.SlotPlaintext {
+			return true
+		}
+	}
+	return false
+}
+
+// unencryptedDisagreement holds a freshly written container to the rule that
+// the advisory flag matches its slots. A writer controls both, so a mismatch
+// here is a bug in this build rather than the legitimate drift a long-lived
+// container is allowed – which is why crossCheck does not apply it.
+func (r *Reader) unencryptedDisagreement() error {
+	flagged := r.sb.Flags&format.FlagUnencrypted != 0
+	if flagged != r.HasPlaintextSlot() {
+		return fmt.Errorf("this container was written with the unencrypted header flag %v and plaintext key slots %v",
+			flagged, r.HasPlaintextSlot())
+	}
+	return nil
 }
 
 func (r *Reader) note(msg string) { r.notices = append(r.notices, msg) }
@@ -199,11 +355,41 @@ func (r *Reader) slotNotice() string {
 	return ""
 }
 
-func (r *Reader) unlockWith(secrets []crypto.Unlocker) error {
+func (r *Reader) unlockWith(secrets []crypto.Unlocker, budget *unlockBudget, cache map[[32]byte]unwrapResult) error {
 	var fmk crypto.FMK
+	var policyErr error
 	for _, slot := range r.table().Slots {
-		for _, secret := range secrets {
-			key, err := slot.Unwrap(r.sb.Cipher, r.sb.ContainerUUID, secret)
+		for secretIndex, secret := range secrets {
+			attempt := unwrapAttemptID(r.sb.ContainerUUID, slot, secretIndex)
+			result, found := cache[attempt]
+			if !found {
+				passphraseAttempt := false
+				if slot.Type == crypto.SlotPassphrase {
+					if _, matching := secret.(crypto.Passphrase); matching {
+						passphraseAttempt = true
+						result.err = budget.admit(slot.KDF)
+					}
+				}
+				if result.err == nil {
+					if passphraseAttempt {
+						budget.starting(slot.KDF)
+					}
+					key, err := slot.Unwrap(r.sb.Cipher, r.sb.ContainerUUID, secret)
+					result.err = err
+					if key != nil {
+						result.fmk = append(crypto.FMK(nil), key...)
+						crypto.Wipe(key)
+					}
+				}
+				cache[attempt] = result
+			}
+			key, err := append(crypto.FMK(nil), result.fmk...), result.err
+			if errors.Is(err, crypto.ErrKDFPolicy) {
+				if policyErr == nil {
+					policyErr = err
+				}
+				continue
+			}
 			if errors.Is(err, crypto.ErrWrongKey) {
 				continue
 			}
@@ -218,6 +404,9 @@ func (r *Reader) unlockWith(secrets []crypto.Unlocker) error {
 		}
 	}
 	if fmk == nil {
+		if policyErr != nil {
+			return fmt.Errorf("%w; use --allow-expensive-kdf only if these parameters are expected", policyErr)
+		}
 		return fmt.Errorf("%w; this container has %s", crypto.ErrWrongKey, describeSlots(r.table().Slots))
 	}
 
@@ -259,10 +448,12 @@ func (r *Reader) readManifest() error {
 	// last volume through, to fail further down as a bare read error instead of
 	// as the truncation this check exists to name.
 	last := r.vols.Last()
-	end := r.sb.TailOffset + 2*r.sb.TailLength + format.SuperblockSize
-	if end < r.sb.TailOffset || end > uint64(last.size) {
+	manifestEnd := r.sb.TailOffset + 2*r.sb.TailLength
+	fileSize := uint64(last.size)
+	partialMirror := fileSize > manifestEnd && fileSize < manifestEnd+format.SuperblockSize
+	if manifestEnd < r.sb.TailOffset || manifestEnd > fileSize || partialMirror {
 		return fmt.Errorf("%s is truncated: its manifest should end at byte %d but the file is %d bytes",
-			filepath.Base(last.path), r.sb.TailOffset+2*r.sb.TailLength, last.size)
+			filepath.Base(last.path), manifestEnd, last.size)
 	}
 
 	var problems []error
@@ -288,6 +479,34 @@ func (r *Reader) readManifest() error {
 	return fmt.Errorf("both copies of the manifest are unusable: %v", errors.Join(problems...))
 }
 
+func (r *Reader) readManifestStrict() error {
+	last := r.vols.Last()
+	end := r.sb.TailOffset + 2*r.sb.TailLength + format.SuperblockSize
+	if end < r.sb.TailOffset || end != uint64(last.size) {
+		return fmt.Errorf("the final volume length does not exactly match its authenticated metadata")
+	}
+	var first *format.Manifest
+	for copyIndex := range 2 {
+		buf := make([]byte, r.sb.TailLength)
+		off := int64(r.sb.TailOffset + uint64(copyIndex)*r.sb.TailLength)
+		if _, err := last.f.ReadAt(buf, off); err != nil {
+			return fmt.Errorf("reading manifest copy %d: %w", copyIndex+1, err)
+		}
+		if sum := sha256.Sum256(buf); subtle.ConstantTimeCompare(sum[:], r.sb.TailSHA256) != 1 {
+			return fmt.Errorf("manifest copy %d does not match the authenticated digest", copyIndex+1)
+		}
+		manifest, err := format.OpenManifest(buf, r.sb.Cipher, r.keys.Manifest, r.sb.ContainerUUID)
+		if err != nil {
+			return fmt.Errorf("manifest copy %d: %w", copyIndex+1, err)
+		}
+		if first == nil {
+			first = manifest
+		}
+	}
+	r.manifest = first
+	return nil
+}
+
 // crossCheck makes the manifest and the header agree. They are written
 // together and sealed separately; a disagreement means one of them is not what
 // it was.
@@ -300,7 +519,27 @@ func (r *Reader) crossCheck() error {
 		return fmt.Errorf("the manifest counts %d shards, the header counts %d", m.DataShardCount, r.sb.DataShardCount)
 	case m.ShardSize != int64(r.sb.ShardSize):
 		return fmt.Errorf("the manifest says shards are %d bytes, the header says %d", m.ShardSize, r.sb.ShardSize)
+	case !m.Created.Equal(r.sb.Created):
+		return fmt.Errorf("the manifest and header record different creation times")
+	case m.DataShards != int(r.sb.DataShards) || m.ParityShards != int(r.sb.ParityShards):
+		return fmt.Errorf("the manifest records a %d+%d stripe, the header records %d+%d",
+			m.DataShards, m.ParityShards, r.sb.DataShards, r.sb.ParityShards)
 	}
+	wantPlan, err := parity.For(m.RecoveryPercent)
+	if err != nil || wantPlan != r.sb.Plan() {
+		return fmt.Errorf("recovery percent %d does not match header stripe %s", m.RecoveryPercent, r.sb.Plan())
+	}
+	// FlagUnencrypted is deliberately *not* cross-checked against the slot set
+	// here. The superblock does not authenticate the slot tables – it cannot,
+	// or every key change would have to re-sign every volume header – so the
+	// two drift apart legitimately: removing the plaintext slot from a NONE
+	// container leaves the flag set on a header nobody may rewrite. Refusing
+	// then would take a container that authenticates completely, whose payload
+	// is intact, and whose keys work, and make it unopenable over an advisory
+	// bit. What is safe to read is decided by the slots, and unlockersFor and
+	// inspect both read the slots. See unencryptedDisagreement, which holds the
+	// writer to the stricter rule for containers BOND has just produced.
+	//
 	// The manifest sits directly after the payload in the last volume, so the
 	// check is against that file's own layout rather than the payload total.
 	last := r.vols.Last()

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -19,14 +20,12 @@ func runRestore(args []string) error {
 	var (
 		dest      string
 		includes  stringList
-		symlinks  bool
 		overwrite bool
 		verbose   bool
 		keys      keyFlags
 	)
 	fs.StringVar(&dest, "to", "", "")
 	fs.Var(&includes, "include", "")
-	fs.BoolVar(&symlinks, "symlinks", false, "")
 	fs.BoolVar(&overwrite, "overwrite", false, "")
 	fs.BoolVar(&verbose, "verbose", false, "")
 	fs.BoolVar(&verbose, "v", false, "")
@@ -40,7 +39,6 @@ Writes a container's contents back to disk.
 options:
       --to <dir>          directory to restore into
       --include <prefix>  restore only paths starting with this; repeat for several
-      --symlinks          restore symbolic links (off by default)
       --overwrite         replace files that already exist
   -v, --verbose           name every file as it is written
 %s
@@ -94,11 +92,10 @@ options:
 
 	progress := ui.NewProgress(os.Stderr)
 	result, err := backup.Restore(context.Background(), r, backup.RestoreOptions{
-		Dest:          dest,
-		Include:       include,
-		AllowSymlinks: symlinks,
-		Overwrite:     overwrite,
-		Tool:          tool,
+		Dest:      dest,
+		Include:   include,
+		Overwrite: overwrite,
+		Tool:      tool,
 		OnEntry: func(fi archive.FileInfo) {
 			progress.Add(fi.Size)
 			if verbose {
@@ -112,11 +109,22 @@ options:
 		},
 	})
 	progress.Clear()
-	if err != nil {
+	if err != nil && result == nil {
 		return err
 	}
 
-	fmt.Printf("restored    %s, %s, %s in %s\n",
+	// The summary is printed even when the restore failed, because what did
+	// land on disk is worth knowing. The first word must not say otherwise:
+	// "restored 40,000 files" above an error about digests that do not match is
+	// the sentence someone remembers and the error the one they scroll past.
+	status := "restored"
+	switch {
+	case errors.Is(err, backup.ErrIncompleteRestore):
+		status = "incomplete"
+	case err != nil:
+		status = "FAILED"
+	}
+	fmt.Printf("%-11s %s, %s, %s in %s\n", status,
 		ui.Items(result.Stats.Files, "file", "files"),
 		ui.Items(result.Stats.Dirs, "directory", "directories"),
 		ui.Bytes(result.Stats.Bytes),
@@ -127,7 +135,7 @@ options:
 	if result.Verified > 0 {
 		fmt.Printf("verified    %s match the digests recorded at backup time\n", ui.Items(result.Verified, "file", "files"))
 	}
-	return nil
+	return err
 }
 
 func runList(args []string) error {
@@ -174,8 +182,6 @@ options:
 			fmt.Println(e.Path)
 		case e.Kind == archive.KindDir:
 			fmt.Printf("%-10s  %-19s  %s/\n", "", e.ModTime.Format(time.DateTime), e.Path)
-		case e.Kind == archive.KindSymlink:
-			fmt.Printf("%-10s  %-19s  %s -> %s\n", "", e.ModTime.Format(time.DateTime), e.Path, e.Link)
 		default:
 			fmt.Printf("%10s  %-19s  %s\n", ui.Bytes(e.Size), e.ModTime.Format(time.DateTime), e.Path)
 		}
@@ -195,7 +201,11 @@ func openContainer(path string, keys *keyFlags) (*container.Reader, error) {
 		r.Close()
 		return nil, err
 	}
-	if err := r.Unlock(secrets...); err != nil {
+	defer wipeUnlockers(secrets)
+	if keys.allowExpensiveKDF {
+		fmt.Fprintln(os.Stderr, "warning: --allow-expensive-kdf permits unauthenticated container data to request extreme memory or CPU")
+	}
+	if err := r.UnlockWithOptions(keys.unlockOptions(), secrets...); err != nil {
 		r.Close()
 		return nil, err
 	}

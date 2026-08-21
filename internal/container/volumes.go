@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -20,9 +21,9 @@ import (
 //
 // The split is purely physical. The payload is one logical byte range whatever
 // it is stored in, and every volume records which slice of it that volume
-// holds. Volume 1 carries the header and both key-slot tables; the last
-// carries the manifest and the mirrored header; the rest are payload and a
-// header copy so any one file can identify the set it belongs to.
+// holds. Volume 1 carries the header and both key-slot tables; the last carries
+// the manifest; and every volume has an authenticated leading header plus a
+// required mirror at EOF so any one file can identify the set it belongs to.
 //
 // Volumes never split a shard, so any single shard is always readable from one
 // file.
@@ -36,9 +37,70 @@ var volumePattern = regexp.MustCompile(`\.(\d{3,})$`)
 // backup.bond.003 and backup.bond both answer to backup.bond.
 func VolumeBase(path string) string {
 	if m := volumePattern.FindString(path); m != "" {
+		n, err := strconv.ParseUint(m[1:], 10, 64)
+		if err != nil || n == 0 {
+			return path
+		}
 		return strings.TrimSuffix(path, m)
 	}
 	return path
+}
+
+// VolumeFiles discovers a container set by name without trusting a header.
+// It is shared with quick verification so readers and checksum checks accept
+// exactly the same numeric suffixes.
+func VolumeFiles(path string) ([]string, error) {
+	base := VolumeBase(path)
+	dir := filepath.Dir(base)
+	name := filepath.Base(base)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	type numbered struct {
+		n    uint64
+		path string
+	}
+	var found []numbered
+	for _, entry := range entries {
+		candidate := entry.Name()
+		if !numberedVolumeOf(name, candidate) {
+			continue
+		}
+		match := volumePattern.FindString(candidate)
+		n, parseErr := strconv.ParseUint(match[1:], 10, 64)
+		if parseErr != nil {
+			return nil, fmt.Errorf("volume suffix %q is too large", match)
+		}
+		if n == 0 {
+			return nil, fmt.Errorf("%s uses invalid volume number .000", candidate)
+		}
+		found = append(found, numbered{n: n, path: filepath.Join(dir, candidate)})
+	}
+	_, baseErr := os.Stat(base)
+	baseExists := baseErr == nil
+	if baseErr != nil && !os.IsNotExist(baseErr) {
+		return nil, baseErr
+	}
+	if baseExists && len(found) > 0 {
+		return nil, fmt.Errorf("both %s and a numbered set with the same base exist", filepath.Base(base))
+	}
+	if baseExists {
+		return []string{base}, nil
+	}
+	if len(found) == 0 {
+		return nil, fmt.Errorf("%s does not exist", path)
+	}
+	sort.Slice(found, func(i, j int) bool { return found[i].n < found[j].n })
+	paths := make([]string, len(found))
+	for i, volume := range found {
+		want := uint64(i + 1)
+		if volume.n != want {
+			return nil, fmt.Errorf("numbered volume set is not contiguous: found .%03d where .%03d is required", volume.n, want)
+		}
+		paths[i] = volume.path
+	}
+	return paths, nil
 }
 
 // headerPos is which of a volume's two header positions a copy came from.
@@ -108,20 +170,6 @@ func (v *volume) use(i int) {
 
 func (v *volume) source() string { return v.scan.copies[v.using].source }
 
-// mirrorRoom reports whether this volume has space between the end of its
-// payload and the end of the file for a mirrored header.
-//
-// It is how a mirror that was damaged is told apart from one that was never
-// written. Containers made before the mirror was extended to every volume carry
-// one only in the last file, and reporting "the mirror is missing" on every
-// middle volume of a perfectly good older container would be crying wolf. It is
-// also what stops a repair writing a header over the end of a shard – see
-// healMetadata. The numbers come from a header nobody has authenticated yet,
-// but the worst a lie here can do is add or drop a notice.
-func (v *volume) mirrorRoom() bool {
-	return v.size >= v.payloadStart+v.logicalLen+format.SuperblockSize
-}
-
 // headerNotice says what had to be worked around for this volume's header, or
 // "" when both copies were intact. It means anything only after authenticate
 // has settled which copy is real.
@@ -140,8 +188,6 @@ func (v *volume) headerNotice(volumes int) string {
 	switch {
 	case v.scan.copies[v.using].at != headerLeading:
 		return "the header at the front" + where + " is damaged; the mirror at the end was used"
-	case !v.mirrorRoom():
-		return "" // written before every volume carried a mirror
 	case !v.scan.twin:
 		return "the mirrored header at the end" + where + " is damaged; only one copy of it is left"
 	}
@@ -182,6 +228,11 @@ type volumeSet struct {
 // Any file of the set will do: each carries a header copy saying how many
 // there are, so a restore started from volume 7 finds the rest.
 func openVolumes(path string) (*volumeSet, *format.Superblock, string, error) {
+	if match := volumePattern.FindString(path); match != "" {
+		if n, err := strconv.ParseUint(match[1:], 10, 64); err != nil || n == 0 {
+			return nil, nil, "", fmt.Errorf("invalid numbered volume suffix %q", match)
+		}
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		// A set written with splitting on is named .001 even when it turned

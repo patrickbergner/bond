@@ -155,7 +155,7 @@ func (f *Filter) key(s string) string {
 	return s
 }
 
-// File decides whether one file, symlink or other non-directory is stored.
+// File decides whether one resolved non-directory is stored.
 func (f *Filter) File(rel string) Verdict {
 	k := f.key(rel)
 	if r, hit := f.excluded(k, false); hit {
