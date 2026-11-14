@@ -41,7 +41,7 @@ const (
 const (
 	infoRecipientX25519 = "bond/v1/recipient-x25519"
 	infoRecipientMLKEM  = "bond/v1/recipient-mlkem"
-	infoRecipientKEK    = "bond/v1/recipient-kek"
+	infoRecipientKEK    = "bond/v2/recipient-kek"
 )
 
 // SlotRecipient is a hybrid public-key slot.
@@ -210,11 +210,9 @@ func NewRecipientSlot(c Cipher, containerUUID []byte, fmk FMK, pub *RecipientPub
 		Encapsulation: encapsulation,
 	}
 
-	aead, err := AEAD(c, kek)
-	if err != nil {
+	if err := s.seal(c, containerUUID, kek, fmk); err != nil {
 		return nil, err
 	}
-	s.Wrapped = aead.Seal(nil, s.Nonce, fmk, s.aad(containerUUID))
 	return s, nil
 }
 
@@ -246,15 +244,7 @@ func (s *Slot) unwrapRecipient(c Cipher, containerUUID []byte, priv *RecipientPr
 	}
 	defer Wipe(kek)
 
-	aead, err := AEAD(c, kek)
-	if err != nil {
-		return nil, err
-	}
-	fmk, err := aead.Open(nil, s.Nonce, s.Wrapped, s.aad(containerUUID))
-	if err != nil {
-		return nil, ErrWrongKey
-	}
-	return fmk, nil
+	return s.open(c, containerUUID, kek)
 }
 
 // recipientKEK combines the two shared secrets.
@@ -265,11 +255,7 @@ func (s *Slot) unwrapRecipient(c Cipher, containerUUID []byte, priv *RecipientPr
 // slot from steering the result: change any of it and the key that comes out
 // is a different one, and the wrapped master key no longer opens.
 func recipientKEK(classical, quantum, encapsulation, recipientPub, salt []byte) ([]byte, error) {
-	secret := make([]byte, 0, len(classical)+len(quantum)+len(encapsulation)+len(recipientPub))
-	secret = append(secret, classical...)
-	secret = append(secret, quantum...)
-	secret = append(secret, encapsulation...)
-	secret = append(secret, recipientPub...)
+	secret := Tuple(classical, quantum, encapsulation, recipientPub)
 	defer Wipe(secret)
 	return deriveHKDF(secret, salt, infoRecipientKEK)
 }

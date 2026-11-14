@@ -127,12 +127,13 @@ func FuzzUnmarshal(f *testing.F) {
 
 func validSlotTable(t *testing.T) []byte {
 	table := &SlotTable{Generation: 1, Slots: []*crypto.Slot{{
-		Type:    crypto.SlotPassphrase,
-		UUID:    make([]byte, 16),
-		Nonce:   make([]byte, crypto.NonceLen),
-		Salt:    make([]byte, 16),
-		Wrapped: make([]byte, crypto.KeyLen+crypto.TagLen),
-		Label:   "seed",
+		Type:       crypto.SlotPassphrase,
+		UUID:       make([]byte, 16),
+		Nonce:      make([]byte, crypto.NonceLen),
+		Salt:       make([]byte, 16),
+		Wrapped:    make([]byte, crypto.KeyLen+crypto.TagLen),
+		Commitment: make([]byte, crypto.CommitmentLen),
+		Label:      "seed",
 	}}}
 	b, err := table.Marshal(nil)
 	if err != nil {

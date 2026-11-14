@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/bits"
 	"strings"
 	"time"
 
@@ -33,7 +34,11 @@ type Manifest struct {
 
 	Compression Compression `json:"compression"`
 
+	// StreamLength is the exact length of the compressed stream. PaddedLength
+	// is what the shards hold – the stream followed by zeros up to its Padmé
+	// length – and is the number the header carries in the clear.
 	StreamLength   int64  `json:"streamLength"`
+	PaddedLength   int64  `json:"paddedLength"`
 	StreamSHA256   string `json:"streamSha256"`
 	ShardSize      int64  `json:"shardSize"`
 	DataShardCount int64  `json:"dataShardCount"`
@@ -99,7 +104,14 @@ func SealManifest(m *Manifest, c crypto.Cipher, manifestKey, containerUUID []byt
 	if err != nil {
 		return nil, err
 	}
-	sealed := aead.Seal(nil, nonce, packed.Bytes(), crypto.ManifestAAD(containerUUID))
+	// The compressed manifest is length-prefixed and padded before it is
+	// sealed, for the same reason the payload is: its size follows the number
+	// of files and the length of their names, and that is not the storage
+	// provider's business.
+	inner := make([]byte, Padme(uint64(8+packed.Len())))
+	binary.LittleEndian.PutUint64(inner, uint64(packed.Len()))
+	copy(inner[8:], packed.Bytes())
+	sealed := aead.Seal(nil, nonce, inner, crypto.ManifestAAD(containerUUID))
 
 	out := make([]byte, 0, 8+len(nonce)+len(sealed))
 	out = binary.LittleEndian.AppendUint64(out, uint64(len(sealed)))
@@ -124,9 +136,22 @@ func OpenManifest(framed []byte, c crypto.Cipher, manifestKey, containerUUID []b
 	if err != nil {
 		return nil, err
 	}
-	packed, err := aead.Open(nil, nonce, sealed, crypto.ManifestAAD(containerUUID))
+	inner, err := aead.Open(nil, nonce, sealed, crypto.ManifestAAD(containerUUID))
 	if err != nil {
 		return nil, fmt.Errorf("the manifest fails authentication; it has been damaged or altered")
+	}
+	if len(inner) < 8 {
+		return nil, fmt.Errorf("the manifest is not readable: it is shorter than its own length field")
+	}
+	packedLen := binary.LittleEndian.Uint64(inner)
+	if packedLen > uint64(len(inner)-8) || Padme(8+packedLen) != uint64(len(inner)) {
+		return nil, fmt.Errorf("the manifest is not readable: its length field does not match its padding")
+	}
+	packed := inner[8 : 8+packedLen]
+	for _, b := range inner[8+packedLen:] {
+		if b != 0 {
+			return nil, fmt.Errorf("the manifest is not readable: its padding is not empty")
+		}
 	}
 
 	zr, err := gzip.NewReader(bytes.NewReader(packed))
@@ -161,6 +186,25 @@ func OpenManifest(framed []byte, c crypto.Cipher, manifestKey, containerUUID []b
 	return &m, nil
 }
 
+// Padme is the padded length of n bytes (Nikitin et al., "Reducing Metadata
+// Leakage from Encrypted Files and Communication with PURBs", 2019).
+//
+// It keeps the top bits of a length and rounds the rest up, so the padded
+// length says roughly how large something is and not exactly: for a length
+// with bit length E+1 the low E − ⌊log₂E⌋ − 1 bits are rounded away. The cost
+// falls in steps: at most 12.5% below 256 bytes, 6.3% up to 64 KiB, 3.2% from
+// there to 4 GiB and 1.6% above, where padding to a power of two would cost up
+// to 100%.
+func Padme(n uint64) uint64 {
+	if n < 2 {
+		return n
+	}
+	e := uint(bits.Len64(n) - 1)     // ⌊log₂ n⌋
+	s := uint(bits.Len64(uint64(e))) // ⌊log₂ e⌋ + 1
+	mask := uint64(1)<<(e-s) - 1     // the bits rounded away
+	return (n + mask) &^ mask
+}
+
 // Validate checks the authenticated manifest's semantic contract. Strict
 // validation turns future format drift into a clear version error instead of a
 // late restore failure or an accidental fallback to raw tar.
@@ -186,7 +230,7 @@ func (m *Manifest) Validate() error {
 	if !m.Compression.Solid {
 		return fmt.Errorf("the payload is not recorded as a solid stream")
 	}
-	if m.StreamLength < 0 || m.ShardSize < 0 || m.DataShardCount < 0 ||
+	if m.StreamLength < 0 || m.PaddedLength < 0 || m.ShardSize < 0 || m.DataShardCount < 0 ||
 		m.RecoveryPercent < 0 || m.DataShards < 0 || m.ParityShards < 0 ||
 		m.Files < 0 || m.Dirs < 0 || m.SkippedSymlinks < 0 || m.Bytes < 0 {
 		return fmt.Errorf("manifest counts and sizes must not be negative")
@@ -194,10 +238,13 @@ func (m *Manifest) Validate() error {
 	if m.ShardSize <= crypto.TagLen || m.ShardSize%4096 != 0 {
 		return fmt.Errorf("shardSize %d is not a positive multiple of 4096 with room for an authentication tag", m.ShardSize)
 	}
+	if uint64(m.PaddedLength) != Padme(uint64(m.StreamLength)) {
+		return fmt.Errorf("paddedLength is %d, a stream of %d bytes pads to %d", m.PaddedLength, m.StreamLength, Padme(uint64(m.StreamLength)))
+	}
 	plainPerShard := m.ShardSize - crypto.TagLen
 	expectedShards := int64(0)
-	if m.StreamLength > 0 {
-		expectedShards = (m.StreamLength + plainPerShard - 1) / plainPerShard
+	if m.PaddedLength > 0 {
+		expectedShards = (m.PaddedLength + plainPerShard - 1) / plainPerShard
 	}
 	if m.DataShardCount != expectedShards {
 		return fmt.Errorf("dataShardCount is %d, stream length and shard size require %d", m.DataShardCount, expectedShards)

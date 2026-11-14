@@ -18,7 +18,7 @@ import (
 func validManifest() Manifest {
 	empty := sha256.Sum256(nil)
 	return Manifest{
-		FormatVersion: 1,
+		FormatVersion: VersionMajor,
 		Created:       time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
 		Compression:   Compression{Format: "none", Solid: true},
 		StreamSHA256:  hex.EncodeToString(empty[:]),
@@ -31,7 +31,7 @@ func TestManifestValidateRejectsInvalidSemantics(t *testing.T) {
 	stamp := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	digest := strings.Repeat("0", 64)
 	tests := map[string]func(*Manifest){
-		"version":            func(m *Manifest) { m.FormatVersion = 2 },
+		"version":            func(m *Manifest) { m.FormatVersion = VersionMajor + 1 },
 		"created":            func(m *Manifest) { m.Created = time.Time{} },
 		"compression":        func(m *Manifest) { m.Compression.Format = "future" },
 		"compression level":  func(m *Manifest) { m.Compression.Level = 1 },

@@ -31,15 +31,15 @@ build() {
 
 round_trips() {
     local id="$1"
-    bond_ok verify "$CONTAINER"
+    bond_ok verify --allow-unencrypted "$CONTAINER"
     expect_out "OK"
-    bond_ok restore "$CONTAINER" --to "$CASE_TMP/restored-$id"
+    bond_ok restore --allow-unencrypted "$CONTAINER" --to "$CASE_TMP/restored-$id"
     assert_trees_equal "$SOURCE" "$CASE_TMP/restored-$id/src-$id"
 }
 
 step "the smallest shard the format allows still round-trips"
 build tiny-shards 1024 'config_setting "\"shardBytes\": 65536"'
-bond_ok inspect "$CONTAINER"
+bond_ok inspect --allow-unencrypted "$CONTAINER"
 expect_out "shard size        64.0 KiB"
 round_trips tiny-shards
 
@@ -55,15 +55,15 @@ config_target one-shard "$SOURCE"
 config_write "$cfg"
 bond_ok backup --config "$cfg"
 CONTAINER="$(container_in "$CASE_TMP/out-one-shard")"
-bond_ok inspect "$CONTAINER"
+bond_ok inspect --allow-unencrypted "$CONTAINER"
 expect_out "shards            1"
 round_trips one-shard
 
 step "an empty tree is backed up and restored as the empty tree it is"
 build nothing 0 ''
-bond_ok verify "$CONTAINER"
+bond_ok verify --allow-unencrypted "$CONTAINER"
 expect_out "OK"
-bond_ok restore "$CONTAINER" --to "$CASE_TMP/restored-nothing"
+bond_ok restore --allow-unencrypted "$CONTAINER" --to "$CASE_TMP/restored-nothing"
 [ -z "$(find "$CASE_TMP/restored-nothing" -type f 2>/dev/null)" ] ||
     fail "restoring an empty backup produced files"
 
@@ -73,7 +73,7 @@ step "shardBytes is a ceiling, not a fixed size: a small backup gets smaller sha
 # The container is expected to pick a smaller shard instead, so the number an
 # operator wrote down is the number they get.
 build big-shards 2048 'config_setting "\"shardBytes\": 4194304"; config_setting "\"recoveryPercent\": 10"'
-bond_ok inspect "$CONTAINER"
+bond_ok inspect --allow-unencrypted "$CONTAINER"
 shard_line=$(printf '%s\n' "$BOND_OUT" | sed -n 's/^  shard size  *//p')
 case "$shard_line" in
     *MiB) fail "a 2 MiB backup was given $shard_line shards, so recoveryPercent could not have been honoured" ;;
@@ -92,23 +92,23 @@ round_trips big-shards
 
 step "recoveryPercent 0 writes no recovery data, and says so rather than implying otherwise"
 build no-recovery 1024 'config_setting "\"recoveryPercent\": 0"; config_setting "\"shardBytes\": 65536"'
-bond_ok inspect "$CONTAINER"
+bond_ok inspect --allow-unencrypted "$CONTAINER"
 expect_out "recovery data     none"
 round_trips no-recovery
 
 step "damage to a container with no recovery data is still found, and honestly called unrepairable"
 poke_payload "$CONTAINER" 100000 256
-bond_fail verify "$CONTAINER"
+bond_fail verify --allow-unencrypted "$CONTAINER"
 expect_err "this container carries no recovery data, so the damage cannot be repaired"
 expect_err "restore from another copy"
 
 step "repair does not pretend it can help"
-bond_fail repair "$CONTAINER"
+bond_fail repair --allow-unencrypted "$CONTAINER"
 assert_missing "$CASE_TMP/out-no-recovery/$(basename "${CONTAINER%.bond}").repaired.bond"
 
 step "the most recovery data the format allows survives correspondingly more damage"
 build most-recovery 1024 'config_setting "\"recoveryPercent\": 50"; config_setting "\"shardBytes\": 65536"'
-bond_ok inspect "$CONTAINER"
+bond_ok inspect --allow-unencrypted "$CONTAINER"
 expect_out "recovery data     "
 expect_no_out "recovery data     none"
 half_size=$(file_bytes "$CONTAINER")
@@ -119,10 +119,10 @@ build least-recovery 1024 'config_setting "\"recoveryPercent\": 1"; config_setti
 step "shards knocked out one at a time are rebuilt while the parity still covers them"
 build repairable 2048 'config_setting "\"recoveryPercent\": 40"; config_setting "\"shardBytes\": 65536"'
 poke_payload "$CONTAINER" 70000 512
-bond_fail verify "$CONTAINER"
+bond_fail verify --allow-unencrypted "$CONTAINER"
 expect_out "repairable  yes"
-bond_ok repair "$CONTAINER"
-bond_ok restore "$CASE_TMP/out-repairable/$(basename "${CONTAINER%.bond}").repaired.bond" \
+bond_ok repair --allow-unencrypted "$CONTAINER"
+bond_ok restore --allow-unencrypted "$CASE_TMP/out-repairable/$(basename "${CONTAINER%.bond}").repaired.bond" \
     --to "$CASE_TMP/restored-repairable"
 assert_trees_equal "$SOURCE" "$CASE_TMP/restored-repairable/src-repairable"
 
@@ -130,9 +130,9 @@ assert_trees_equal "$SOURCE" "$CASE_TMP/restored-repairable/src-repairable"
 
 step "without a stored file index, list says so and says what to do instead of guessing"
 build no-index 512 'config_setting "\"storeFileIndex\": false"'
-bond_ok inspect "$CONTAINER"
+bond_ok inspect --allow-unencrypted "$CONTAINER"
 expect_out "file index        not stored"
-bond_fail list "$CONTAINER"
+bond_fail list --allow-unencrypted "$CONTAINER"
 expect_err "written without a file index"
 expect_err "restore it to see what is inside"
 
@@ -141,7 +141,7 @@ round_trips no-index
 
 step "with the index stored, the listing needs nothing decompressed"
 build with-index 512 'config_setting "\"storeFileIndex\": true"'
-bond_ok inspect "$CONTAINER"
+bond_ok inspect --allow-unencrypted "$CONTAINER"
 expect_out "entries recorded"
 
 # ---------------------------------------------------------------------------

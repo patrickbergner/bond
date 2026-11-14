@@ -9,6 +9,9 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/text/cases"
+	"golang.org/x/text/unicode/norm"
+
 	"github.com/patrickbergner/bond/internal/archive"
 	"github.com/patrickbergner/bond/internal/container"
 	"github.com/patrickbergner/bond/internal/sevenzip"
@@ -69,7 +72,10 @@ func Restore(ctx context.Context, r *container.Reader, opts RestoreOptions) (*Re
 		return nil, err
 	}
 
-	source := stream
+	// The stream is the slow end of a restore, so it is where an interrupt is
+	// noticed.
+	var source io.Reader = &contextReader{ctx: ctx, r: stream}
+	stream = source
 	var closer io.Closer
 	switch r.Manifest().Compression.Format {
 	case "xz":
@@ -161,6 +167,13 @@ func Restore(ctx context.Context, r *container.Reader, opts RestoreOptions) (*Re
 			return nil, fmt.Errorf("the compressed stream did not end cleanly: %w", err)
 		}
 	}
+	// A tar reader stops at the archive's end marker and a decompressor at the
+	// end of its stream; neither asks for what follows. What follows is the
+	// container's padding, and it is read here so that the restore has
+	// authenticated every shard, not only the ones that carried data.
+	if _, err := io.Copy(io.Discard, stream); err != nil {
+		return nil, fmt.Errorf("the end of the container did not authenticate: %w", err)
+	}
 
 	result.Stats = stats
 	result.Elapsed = time.Since(started)
@@ -201,7 +214,7 @@ func checkCaseCollisions(index []archive.FileInfo) error {
 	}
 	seen := make(map[string]string, len(index))
 	for _, f := range index {
-		folded := strings.ToLower(f.Path)
+		folded := foldName(f.Path)
 		if first, clash := seen[folded]; clash && first != f.Path {
 			return fmt.Errorf("this container holds both %q and %q, which are the same file on this system; "+
 				"restore it somewhere case is significant, or use --include to take one of them", first, f.Path)
@@ -211,7 +224,21 @@ func checkCaseCollisions(index []archive.FileInfo) error {
 	return nil
 }
 
+// foldName brings a path to the form in which Windows and macOS compare names:
+// Unicode case folding, which is not the same as lower-casing ("ẞ" and "ß",
+// "Σ" and "ς"), over normalization form C, because APFS treats a precomposed
+// character and its decomposed spelling as one name.
+func foldName(path string) string {
+	return norm.NFC.String(nameFolder.String(norm.NFC.String(path)))
+}
+
+var nameFolder = cases.Fold()
+
 // caseInsensitiveFS is where two names differing only in case are one file.
+// It goes by platform, not by asking the destination: a case-sensitive volume
+// on macOS or a case-sensitive directory on Windows is refused a restore it
+// could have taken, which is the safe direction to be wrong in, and --include
+// is the way round it.
 const caseInsensitiveFS = runtime.GOOS == "windows" || runtime.GOOS == "darwin"
 
 func truncate(s []string, n int) []string {

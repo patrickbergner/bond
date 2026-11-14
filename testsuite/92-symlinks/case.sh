@@ -26,7 +26,7 @@ config_target links "$src"
 config_write "$cfg"
 bond_ok backup --config "$cfg"
 expect_out "links skipped"
-bond_ok restore "$(container_in "$CASE_TMP/output-skipped")" --to "$CASE_TMP/restored-skipped"
+bond_ok restore --allow-unencrypted "$(container_in "$CASE_TMP/output-skipped")" --to "$CASE_TMP/restored-skipped"
 assert_exists "$CASE_TMP/restored-skipped/links/real/target.txt"
 assert_missing "$CASE_TMP/restored-skipped/links/pointer.txt"
 assert_missing "$CASE_TMP/restored-skipped/links/pointer-to-nowhere"
@@ -40,7 +40,7 @@ config_target followed "$src" '"excludedFileNames": ["pointer-to-nowhere"]'
 config_write "$cfg"
 bond_ok backup --config "$cfg"
 expect_out "loop"
-bond_ok restore "$(container_in "$CASE_TMP/output-followed")" --to "$CASE_TMP/restored-followed"
+bond_ok restore --allow-unencrypted "$(container_in "$CASE_TMP/output-followed")" --to "$CASE_TMP/restored-followed"
 [ -f "$CASE_TMP/restored-followed/links/pointer.txt" ] ||
     fail "with followSymlinks set, the link should have been stored as a file"
 [ ! -L "$CASE_TMP/restored-followed/links/pointer.txt" ] ||

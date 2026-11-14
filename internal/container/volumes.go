@@ -46,11 +46,36 @@ func VolumeBase(path string) string {
 	return path
 }
 
+// SetBase is VolumeBase for a file that is there to be looked at.
+//
+// A name alone cannot say whether ".2026" is a volume number or part of what
+// someone called their backup, and going by the name made "photos.2026" a
+// stray volume of "photos": the quick check went looking for photos.001, and a
+// repair of it was named after a set that did not exist. So a numeric suffix
+// counts as a volume number only when it is the first one, or when the first
+// volume of that set is beside it.
+func SetBase(path string) string {
+	base := VolumeBase(path)
+	if base == path {
+		return path
+	}
+	if _, err := os.Stat(path); err != nil {
+		return base // nothing to look at; the name is all there is
+	}
+	if strings.HasSuffix(path, VolumeSuffix(0)) && path == base+VolumeSuffix(0) {
+		return base
+	}
+	if _, err := os.Stat(base + VolumeSuffix(0)); err == nil {
+		return base
+	}
+	return path
+}
+
 // VolumeFiles discovers a container set by name without trusting a header.
 // It is shared with quick verification so readers and checksum checks accept
 // exactly the same numeric suffixes.
 func VolumeFiles(path string) ([]string, error) {
-	base := VolumeBase(path)
+	base := SetBase(path)
 	dir := filepath.Dir(base)
 	name := filepath.Base(base)
 	entries, err := os.ReadDir(dir)
@@ -132,10 +157,20 @@ type headerScan struct {
 	twin   bool         // the mirror parsed and matched the leading copy byte for byte
 }
 
+// maxOpenVolumes is how many files of a set a reader keeps open at once.
+//
+// A set can be thousands of files – 400 GB in 100 MB volumes is four thousand –
+// and holding a descriptor for each runs into the process limit long before it
+// runs into anything else. Reading is sequential, so a handful is all that is
+// ever in use; the rest are opened when a read reaches them and the oldest are
+// closed to make room.
+const maxOpenVolumes = 16
+
 // volume is one file of a set.
 type volume struct {
 	path string
-	f    *os.File
+	f    *os.File // nil while closed; ReadAt opens it again
+	set  *volumeSet
 	size int64
 
 	// scan holds the header copies that parsed, leading one first. Both are
@@ -221,6 +256,43 @@ func (v *volume) authenticate(keys *crypto.Keys) error {
 // volumeSet presents a whole container, however many files it is in.
 type volumeSet struct {
 	vols []*volume
+	open []*volume // the volumes holding a descriptor, oldest first
+}
+
+// add puts a volume, already open, into the set.
+func (vs *volumeSet) add(v *volume) {
+	v.set = vs
+	vs.vols = append(vs.vols, v)
+	vs.opened(v)
+}
+
+// opened records that a volume holds a descriptor and closes the oldest ones
+// beyond the limit.
+func (vs *volumeSet) opened(v *volume) {
+	vs.open = append(vs.open, v)
+	for len(vs.open) > maxOpenVolumes {
+		oldest := vs.open[0]
+		vs.open = vs.open[1:]
+		if oldest.f != nil {
+			oldest.f.Close()
+			oldest.f = nil
+		}
+	}
+}
+
+// ReadAt reads from the volume's file, opening it first if it is closed.
+func (v *volume) ReadAt(p []byte, off int64) (int, error) {
+	if v.f == nil {
+		f, err := os.Open(v.path)
+		if err != nil {
+			return 0, err
+		}
+		v.f = f
+		if v.set != nil {
+			v.set.opened(v)
+		}
+	}
+	return v.f.ReadAt(p, off)
 }
 
 // openVolumes opens the container that path belongs to.
@@ -278,7 +350,9 @@ func openVolumes(path string) (*volumeSet, *format.Superblock, string, error) {
 			// settled which copy is real.
 			v := &volume{path: path, f: f, size: info.Size(), scan: scan}
 			v.use(i)
-			return &volumeSet{vols: []*volume{v}}, v.sb, v.source(), nil
+			set := &volumeSet{}
+			set.add(v)
+			return set, v.sb, v.source(), nil
 		}
 		set, err := openSet(path, scan.copies[i].sb)
 		if err != nil {
@@ -349,7 +423,7 @@ func openSet(path string, sb *format.Superblock) (*volumeSet, error) {
 
 		v := &volume{path: vp, f: vf, size: vi.Size(), scan: scan}
 		v.use(chosen)
-		set.vols = append(set.vols, v)
+		set.add(v)
 	}
 
 	// A set whose volumes still carry a second header copy cannot be judged on
@@ -465,7 +539,7 @@ func (vs *volumeSet) ReadPayload(p []byte, logical int64) error {
 		if n <= 0 {
 			return io.ErrUnexpectedEOF
 		}
-		if _, err := v.f.ReadAt(p[:n], v.payloadStart+within); err != nil {
+		if _, err := v.ReadAt(p[:n], v.payloadStart+within); err != nil {
 			return err
 		}
 		p = p[n:]
@@ -517,8 +591,10 @@ func (vs *volumeSet) Close() error {
 			if closeErr := v.f.Close(); err == nil {
 				err = closeErr
 			}
+			v.f = nil
 		}
 	}
+	vs.open = nil
 	return err
 }
 

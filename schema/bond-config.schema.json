@@ -159,6 +159,11 @@
           "default": "{{TOOL_DIR}}/output",
           "description": "Where finished containers are placed."
         },
+        "signingKey": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Path of a writer key from \"bond keygen --signing-key\". Every container is signed with it, and \"bond restore --expect-writer\" refuses containers it did not sign. Takes the same placeholders as outputPath."
+        },
         "workPath": {
           "type": "string",
           "minLength": 1,

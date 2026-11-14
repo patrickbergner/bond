@@ -11,7 +11,7 @@
 # as readily as with the truth.
 
 DAMAGE_SUPERBLOCK_OFFSET=0        # the header, 4096 bytes
-DAMAGE_RESERVED_OFFSET=248        # first reserved byte inside the header
+DAMAGE_RESERVED_OFFSET=3700       # first reserved byte inside the header (NERDME §3)
 DAMAGE_SLOT_TABLE_A=4096          # 64 KiB
 DAMAGE_SLOT_TABLE_B=69632         # 64 KiB, the spare
 DAMAGE_PAYLOAD_OFFSET=135168      # the first shard begins here, in every container

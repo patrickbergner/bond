@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/patrickbergner/bond/internal/config"
 	"github.com/patrickbergner/bond/internal/container"
@@ -22,6 +23,12 @@ type keyFlags struct {
 	recoveryKey       string
 	recoveryFile      string
 	allowExpensiveKDF bool
+	allowUnencrypted  bool
+	expectWriter      string
+
+	// newBackup holds the passphrase for new backups once it has been read, so
+	// a run over several targets asks once. See backupPassphrase.
+	newBackup []byte
 }
 
 func (k *keyFlags) register(fs *flag.FlagSet) {
@@ -32,6 +39,8 @@ func (k *keyFlags) register(fs *flag.FlagSet) {
 	fs.StringVar(&k.recoveryKey, "recovery-key", "", "printed recovery key, as written on the card")
 	fs.StringVar(&k.recoveryFile, "recovery-key-file", "", "read the recovery key from a file")
 	fs.BoolVar(&k.allowExpensiveKDF, "allow-expensive-kdf", false, "allow Argon2 costs above the local safety policy")
+	fs.BoolVar(&k.allowUnencrypted, "allow-unencrypted", false, "open an unencrypted container through the key stored inside it")
+	fs.StringVar(&k.expectWriter, "expect-writer", "", "refuse a container not signed by this writer key (a bondwp1… key or a .pub file)")
 }
 
 const keyFlagHelp = `  -p, --passphrase <text>        passphrase on the command line (discouraged)
@@ -40,12 +49,64 @@ const keyFlagHelp = `  -p, --passphrase <text>        passphrase on the command 
       --keyfile <path>           32-byte key file
       --recovery-key <text>      printed recovery key (BOND-R1-...)
       --recovery-key-file <path> read the recovery key from a file
-      --allow-expensive-kdf      allow unusually costly Argon2 slots (resource risk)`
+      --allow-expensive-kdf      allow unusually costly Argon2 slots (resource risk)
+      --allow-unencrypted        open an unencrypted container (encryptionMethod NONE);
+                                 its contents are not protected against tampering
+      --expect-writer <key>      refuse a container not signed by this writer
+                                 (a bondwp1… public key, or the .pub file holding it)`
 
 // registerShorthand adds the single-letter aliases, kept separate so the long
 // forms stay the ones documented.
 func (k *keyFlags) registerShorthand(fs *flag.FlagSet) {
 	fs.StringVar(&k.passphrase, "p", "", "")
+}
+
+// minNewPassphrase is the shortest passphrase a new slot is made with, counted
+// in characters. It applies where a passphrase is chosen and never where one is
+// only used: a container opens with whatever it was written with.
+//
+// Argon2id makes every guess expensive and cannot make a short secret long.
+// Twelve characters is where a passphrase of random words or mixed characters
+// starts to outlast the hardware an attacker can rent, and well below it is
+// where a backup that sits in someone else's storage for twenty years is
+// decided by a dictionary.
+const minNewPassphrase = 12
+
+// checkNewPassphrase refuses a passphrase that is too short to protect anything.
+func checkNewPassphrase(pass []byte) error {
+	if n := utf8.RuneCount(pass); n < minNewPassphrase {
+		return fmt.Errorf("a new passphrase needs at least %d characters, and this one has %d; four or five unrelated words are easy to type and hard to guess",
+			minNewPassphrase, n)
+	}
+	return nil
+}
+
+// backupPassphrase is the passphrase new backups are written with. It is read
+// once per run, however many targets the run has.
+//
+// Reading it per target asked an operator at a terminal for the same secret
+// twice per target, and on a pipe it failed outright: the first read took the
+// only line there was, so the second target found standard input empty. Each
+// caller gets a copy of its own, because key specs are wiped after use.
+func (k *keyFlags) backupPassphrase() ([]byte, error) {
+	if k.newBackup == nil {
+		pass, err := k.readPassphrase("Passphrase for the new backups", !k.passphraseGiven())
+		if err != nil {
+			return nil, err
+		}
+		if err := checkNewPassphrase(pass); err != nil {
+			crypto.Wipe(pass)
+			return nil, err
+		}
+		k.newBackup = pass
+	}
+	return append([]byte(nil), k.newBackup...), nil
+}
+
+// forget wipes what backupPassphrase kept.
+func (k *keyFlags) forget() {
+	crypto.Wipe(k.newBackup)
+	k.newBackup = nil
 }
 
 // passphraseGiven reports whether a passphrase arrived without prompting.
@@ -167,9 +228,23 @@ func (k *keyFlags) unlockersFor(slots []*crypto.Slot) ([]crypto.Unlocker, error)
 			wipeUnlockers(out)
 		}
 	}()
-	if kinds[crypto.SlotPlaintext] {
-		// An unencrypted container needs nothing from anyone.
+	// The plaintext slot is never offered on the container's say-so. The slot
+	// table is read before anything authenticates it, so whoever stores the
+	// file decides whether it lists one – and a container that opens through it
+	// proves nothing about who wrote it. Offering it unasked let a substituted
+	// container restore under any passphrase the operator typed, or under none.
+	// It takes the operator saying that an unencrypted container is expected,
+	// and it is never mixed with a real key.
+	if k.allowUnencrypted {
+		if k.keyfile != "" || k.recoveryGiven() || k.passphraseGiven() {
+			return nil, badUsage("--allow-unencrypted opens a container through the key stored inside it and cannot be combined with a key; give one or the other")
+		}
+		if !kinds[crypto.SlotPlaintext] {
+			return nil, fmt.Errorf("--allow-unencrypted was given, but this container is not unencrypted; it opens with %s", listKinds(slots))
+		}
 		out = append(out, crypto.PlaintextSecret{})
+		success = true
+		return out, nil
 	}
 	if k.keyfile != "" {
 		if !kinds[crypto.SlotKeyfile] {
@@ -203,16 +278,28 @@ func (k *keyFlags) unlockersFor(slots []*crypto.Slot) ([]crypto.Unlocker, error)
 	}
 
 	if len(out) == 0 {
+		if kinds[crypto.SlotPlaintext] {
+			return nil, fmt.Errorf("this container is unencrypted: its key is stored inside it, so anyone holding the file can read it " +
+				"and can replace its contents. If that is what this backup was written as (encryptionMethod NONE), open it with --allow-unencrypted")
+		}
 		return nil, fmt.Errorf("no key was given for a container that opens with %s", listKinds(slots))
 	}
 	success = true
 	return out, nil
 }
 
-func (k *keyFlags) unlockOptions() container.UnlockOptions {
+func (k *keyFlags) unlockOptions() (container.UnlockOptions, error) {
 	policy := crypto.DefaultKDFPolicy
 	policy.AllowExpensive = k.allowExpensiveKDF
-	return container.UnlockOptions{KDFPolicy: policy}
+	opts := container.UnlockOptions{KDFPolicy: policy}
+	if k.expectWriter != "" {
+		pub, err := loadWriterPublic(k.expectWriter)
+		if err != nil {
+			return opts, badUsage("--expect-writer: %v", err)
+		}
+		opts.ExpectWriter = pub
+	}
+	return opts, nil
 }
 
 func wipeUnlockers(unlockers []crypto.Unlocker) {
@@ -279,7 +366,7 @@ func (k *keyFlags) createSpecs(settings config.Resolved, kdf crypto.KDFParams) (
 		specs = append(specs, container.KeySpec{Secret: crypto.PlaintextSecret{}, Label: "unencrypted"})
 
 	case config.EncryptionPassphrase:
-		pass, err := k.readPassphrase("Passphrase for the new backup", !k.passphraseGiven())
+		pass, err := k.backupPassphrase()
 		if err != nil {
 			return nil, false, err
 		}

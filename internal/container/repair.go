@@ -1,6 +1,7 @@
 package container
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -20,8 +21,8 @@ type RepairResult struct {
 	Stripes       int
 	Report        Report // the verification of the repaired copy
 
-	// Metadata names the regions rewritten from their spare copy: the header,
-	// the key-slot tables.
+	// Metadata names the regions rewritten from their intact copy: the header,
+	// the key-slot tables, the manifest.
 	Metadata []string
 }
 
@@ -39,7 +40,12 @@ func (r *RepairResult) Repaired() int { return len(r.RepairedData) + len(r.Repai
 // parity covers. Every rebuilt shard is then decrypted and authenticated: Reed-
 // Solomon says the bytes were reconstructed, and only the authentication tag
 // says they are the right ones.
-func Repair(r *Reader, dst string, report Report, progress func(stripe, total int)) (*RepairResult, error) {
+//
+// The repaired set is assembled under staging names beside dst, verified in
+// full, and only then moved into place without replacing anything. A repair
+// that fails or is interrupted therefore leaves nothing behind: a file named
+// like a repaired container is one.
+func Repair(ctx context.Context, r *Reader, dst string, report Report, progress func(stripe, total int)) (*RepairResult, error) {
 	if !r.unlocked {
 		return nil, fmt.Errorf("the container is locked")
 	}
@@ -67,16 +73,27 @@ func Repair(r *Reader, dst string, report Report, progress func(stripe, total in
 		return nil, err
 	}
 
+	if err := ValidatePublication(filepath.Dir(dst), dst); err != nil {
+		return nil, err
+	}
+
 	// Start from a copy: everything that is intact stays byte for byte what it
 	// was, including the header, the key slots and the manifest. A split
 	// container is copied volume for volume, keeping the numbering.
-	out, err := copySet(r.vols, dst)
+	split := r.vols.Count() > 1
+	out, err := copySet(ctx, r.vols, dst+stagingSuffix)
 	if err != nil {
 		return nil, err
 	}
-	defer out.Close()
+	published := false
+	defer func() {
+		out.Close()
+		if !published {
+			out.Remove()
+		}
+	}()
 
-	result := &RepairResult{Path: dst, Paths: out.Paths(), Stripes: l.Stripes()}
+	result := &RepairResult{Path: dst, Stripes: l.Stripes()}
 	if metadata {
 		names, err := out.healMetadata(r)
 		if err != nil {
@@ -84,16 +101,71 @@ func Repair(r *Reader, dst string, report Report, progress func(stripe, total in
 		}
 		result.Metadata = names
 	}
-	if !report.Damaged() {
-		if err := out.Sync(); err != nil {
+	if report.Damaged() {
+		if err := r.rebuildShards(ctx, out, aead, report, progress, result); err != nil {
 			return nil, err
 		}
-		return result, nil
+	}
+	if err := out.Sync(); err != nil {
+		return nil, err
+	}
+	if err := out.Close(); err != nil {
+		return nil, err
 	}
 
+	// A repaired container is worth nothing until it has been checked as a
+	// whole, and it is checked before it gets its name.
+	after, err := verifyStaged(out.paths[0], r.keys)
+	if err != nil {
+		return nil, fmt.Errorf("the repaired copy does not read back: %w", err)
+	}
+	if !after.Healthy() {
+		return nil, fmt.Errorf("the repaired copy is still damaged; the recovery data was not enough")
+	}
+	result.Report = after
+
+	staged := &volumeWriter{base: dst + stagingSuffix, split: split}
+	for i, path := range out.paths {
+		staged.files = append(staged.files, &volumeFile{path: path, index: i})
+	}
+	paths, err := staged.Publish(dst)
+	if err != nil {
+		return nil, fmt.Errorf("publishing the repaired container: %w", err)
+	}
+	published = true
+	result.Paths = paths
+	return result, nil
+}
+
+// stagingSuffix marks a repaired set that has not been verified yet.
+const stagingSuffix = ".partial"
+
+// verifyStaged re-opens a freshly written set and checks all of it: both copies
+// of every piece of metadata under the keys already in hand, then every shard.
+func verifyStaged(path string, keys *crypto.Keys) (Report, error) {
+	check, err := Open(path)
+	if err != nil {
+		return Report{}, err
+	}
+	defer func() {
+		// The keys belong to the reader being repaired; Close must not wipe them.
+		check.keys = nil
+		check.Close()
+	}()
+	if err := check.AuthenticateWithKeys(keys); err != nil {
+		return Report{}, err
+	}
+	check.keys, check.unlocked = keys, true
+	return check.Verify(nil)
+}
+
+// rebuildShards reconstructs every damaged stripe into out.
+func (r *Reader) rebuildShards(ctx context.Context, out *repairTarget, aead shardOpenSealer, report Report,
+	progress func(stripe, total int), result *RepairResult) error {
+	l := r.sb.Layout()
 	coder, err := parity.NewCoder(l.Plan)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	damagedData := make(map[uint64]bool, len(report.DamagedShards))
@@ -106,6 +178,9 @@ func Repair(r *Reader, dst string, report Report, progress func(stripe, total in
 	}
 
 	for s := range l.Stripes() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if progress != nil {
 			progress(s+1, l.Stripes())
 		}
@@ -127,7 +202,7 @@ func Repair(r *Reader, dst string, report Report, progress func(stripe, total in
 			}
 			raw, err := r.rawShard(index)
 			if err != nil {
-				return nil, fmt.Errorf("reading shard %d: %w", index, err)
+				return fmt.Errorf("reading shard %d: %w", index, err)
 			}
 			// Which shards were damaged was decided by an earlier pass, and the
 			// container has been sitting on untrusted storage in between. A
@@ -136,7 +211,7 @@ func Repair(r *Reader, dst string, report Report, progress func(stripe, total in
 			// it would rebuild the missing shards out of it and produce bytes
 			// that are wrong everywhere instead of missing in one place.
 			if !shardAuthenticates(aead, r.sb, index, raw) {
-				return nil, fmt.Errorf(
+				return fmt.Errorf(
 					"shard %d authenticated when the container was checked and does not now; run bond verify again", index)
 			}
 			data[j] = raw
@@ -149,13 +224,13 @@ func Repair(r *Reader, dst string, report Report, progress func(stripe, total in
 			}
 			raw, err := r.readParity(aead, s, q)
 			if err != nil {
-				return nil, fmt.Errorf("reading parity: %w", err)
+				return fmt.Errorf("reading parity: %w", err)
 			}
 			parityShards[q] = raw
 		}
 
 		if err := coder.Reconstruct(data, parityShards, lengths, shardLen); err != nil {
-			return nil, fmt.Errorf("stripe %d: %w", s, err)
+			return fmt.Errorf("stripe %d: %w", s, err)
 		}
 
 		// Write back only what was missing, and only after proving it.
@@ -165,10 +240,10 @@ func Repair(r *Reader, dst string, report Report, progress func(stripe, total in
 				continue
 			}
 			if err := verifyRebuiltShard(aead, r.sb, index, data[j]); err != nil {
-				return nil, err
+				return err
 			}
 			if err := out.WritePayload(data[j], int64(l.DataOffset(index))); err != nil {
-				return nil, err
+				return err
 			}
 			result.RepairedData = append(result.RepairedData, index)
 		}
@@ -182,16 +257,20 @@ func Repair(r *Reader, dst string, report Report, progress func(stripe, total in
 			aad := crypto.ShardAAD(r.sb.ContainerUUID, index, r.sb.ShardSize)
 			sealed := aead.Seal(nil, nonce, parityShards[q], aad)
 			if err := out.WritePayload(sealed, int64(l.ParityOffset(s, q))); err != nil {
-				return nil, err
+				return err
 			}
 			result.RepairedParit = append(result.RepairedParit, ref)
 		}
 	}
 
-	if err := out.Sync(); err != nil {
-		return nil, err
-	}
-	return result, nil
+	return nil
+}
+
+// shardOpenSealer is the AEAD as repair uses it: it authenticates what it reads
+// and seals the parity it rebuilds.
+type shardOpenSealer interface {
+	shardOpener
+	Seal(dst, nonce, plaintext, ad []byte) []byte
 }
 
 // shardAuthenticates reports whether sealed really is the shard that belongs at
@@ -248,35 +327,33 @@ func describeUnrepairable(stripes []int, l parity.Layout) string {
 
 // copySet copies every volume of a container to a new set of files, and hands
 // back something that writes into the right one by payload offset.
-func copySet(src *volumeSet, dst string) (*repairTarget, error) {
+func copySet(ctx context.Context, src *volumeSet, dst string) (_ *repairTarget, err error) {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return nil, err
 	}
 
 	t := &repairTarget{}
+	defer func() {
+		if err != nil {
+			t.Close()
+			t.Remove()
+		}
+	}()
 	split := src.Count() > 1
 	for i, v := range src.vols {
 		target := dst
 		if split {
 			target = dst + VolumeSuffix(i)
 		}
-		out, err := os.OpenFile(target, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+		out, err := createStaging(target)
 		if err != nil {
-			t.Close()
-			return nil, err
-		}
-		if _, err := v.f.Seek(0, io.SeekStart); err != nil {
-			out.Close()
-			t.Close()
-			return nil, err
-		}
-		if _, err := io.Copy(out, v.f); err != nil {
-			out.Close()
-			t.Close()
 			return nil, err
 		}
 		t.files = append(t.files, out)
 		t.paths = append(t.paths, target)
+		if _, err := io.Copy(out, &contextReader{ctx: ctx, r: io.NewSectionReader(v, 0, v.size)}); err != nil {
+			return nil, err
+		}
 		t.starts = append(t.starts, v.payloadStart)
 		t.logical = append(t.logical, v.logicalStart)
 		t.lens = append(t.lens, v.logicalLen)
@@ -339,6 +416,16 @@ func (t *repairTarget) healMetadata(r *Reader) ([]string, error) {
 		return nil, err
 	}
 	done = append(done, "both key-slot tables")
+
+	// The manifest, from whichever copy matched the authenticated digest.
+	last := len(t.files) - 1
+	tail := int64(r.sb.TailOffset)
+	for copyIndex := range 2 {
+		if _, err := t.files[last].WriteAt(r.manifestRaw, tail+int64(copyIndex)*int64(len(r.manifestRaw))); err != nil {
+			return nil, err
+		}
+	}
+	done = append(done, "both copies of the manifest")
 	return done, nil
 }
 
@@ -376,12 +463,37 @@ func (t *repairTarget) Sync() error {
 	return nil
 }
 
+// Close closes every file. It is safe to call more than once.
 func (t *repairTarget) Close() error {
 	var err error
-	for _, f := range t.files {
+	for i, f := range t.files {
+		if f == nil {
+			continue
+		}
 		if closeErr := f.Close(); err == nil {
 			err = closeErr
 		}
+		t.files[i] = nil
 	}
 	return err
+}
+
+// Remove deletes the staged files of a repair that did not complete.
+func (t *repairTarget) Remove() {
+	for _, path := range t.paths {
+		os.Remove(path)
+	}
+}
+
+// contextReader stops a long copy when the context is cancelled.
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c *contextReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
 }

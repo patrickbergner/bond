@@ -53,7 +53,7 @@ step "inspect describes the container before a key is offered, and more once it 
 bond_ok inspect "$container" --passphrase-env BOND_TEST_PASS
 expect_out "without a key"
 expect_out "with the key"
-expect_out "format            BOND 1.0"
+expect_out "format            BOND 2.0"
 expect_out "target            documents"
 
 step "inspect without a key says what it cannot show, rather than failing"

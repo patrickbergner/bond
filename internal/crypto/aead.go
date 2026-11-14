@@ -46,10 +46,33 @@ func AEAD(c Cipher, key []byte) (cipher.AEAD, error) {
 // Domain strings that go into associated data, keeping every use of the same
 // key distinguishable from every other.
 const (
-	adData     = "BOND-DATA-V1"
-	adSlot     = "BOND-SLOT-V1"
-	adManifest = "BOND-MANIFEST-V1"
+	adData     = "BOND-DATA-V2"
+	adSlot     = "BOND-SLOT-V2"
+	adManifest = "BOND-MANIFEST-V2"
+	adCommit   = "BOND-COMMIT-V2"
 )
+
+// Tuple encodes several values as one byte string that cannot be read as any
+// other sequence of values: each is preceded by its length as a little-endian
+// uint32.
+//
+// Every associated data, MAC input and combined secret in the format goes
+// through it. Plain concatenation is only unambiguous while every field has a
+// fixed length, and it stops being so – silently, with every test still
+// passing – the day a variable-length field is put next to another one. With
+// the lengths written down there is nothing to get wrong later.
+func Tuple(fields ...[]byte) []byte {
+	n := 0
+	for _, f := range fields {
+		n += 4 + len(f)
+	}
+	out := make([]byte, 0, n)
+	for _, f := range fields {
+		out = binary.LittleEndian.AppendUint32(out, uint32(len(f)))
+		out = append(out, f...)
+	}
+	return out
+}
 
 // ShardNonce is the nonce for one payload shard: a random per-container prefix
 // followed by the shard's index.
@@ -71,29 +94,21 @@ func ShardNonce(prefix []byte, index uint64) []byte {
 // another container encrypted under the same key would too. Neither is
 // something the tag alone would notice.
 func ShardAAD(containerUUID []byte, index uint64, shardSize uint32) []byte {
-	aad := make([]byte, 0, len(adData)+len(containerUUID)+12)
-	aad = append(aad, adData...)
-	aad = append(aad, containerUUID...)
-	aad = binary.LittleEndian.AppendUint64(aad, index)
-	aad = binary.LittleEndian.AppendUint32(aad, shardSize)
-	return aad
+	return Tuple(
+		[]byte(adData),
+		containerUUID,
+		binary.LittleEndian.AppendUint64(nil, index),
+		binary.LittleEndian.AppendUint32(nil, shardSize),
+	)
 }
 
-// SlotAAD binds a wrapped master key to its container and its slot.
-func SlotAAD(containerUUID, slotUUID []byte, slotType uint8, params []byte) []byte {
-	aad := make([]byte, 0, len(adSlot)+len(containerUUID)+len(slotUUID)+1+len(params))
-	aad = append(aad, adSlot...)
-	aad = append(aad, containerUUID...)
-	aad = append(aad, slotUUID...)
-	aad = append(aad, slotType)
-	aad = append(aad, params...)
-	return aad
+// SlotAAD binds a wrapped master key to its container, its slot and the
+// parameters its key-encryption key was made with.
+func SlotAAD(containerUUID, slotUUID []byte, slotType uint8, salt, params []byte) []byte {
+	return Tuple([]byte(adSlot), containerUUID, slotUUID, []byte{slotType}, salt, params)
 }
 
 // ManifestAAD binds the manifest to its container.
 func ManifestAAD(containerUUID []byte) []byte {
-	aad := make([]byte, 0, len(adManifest)+len(containerUUID))
-	aad = append(aad, adManifest...)
-	aad = append(aad, containerUUID...)
-	return aad
+	return Tuple([]byte(adManifest), containerUUID)
 }

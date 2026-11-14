@@ -55,7 +55,10 @@ type Stats struct {
 	Files           int
 	Dirs            int
 	SkippedSymlinks int
-	Bytes           int64
+	// SkippedSpecial counts what is neither a file nor a directory: FIFOs,
+	// sockets and device nodes. They hold nothing a restore could put back.
+	SkippedSpecial int
+	Bytes          int64
 
 	ExcludedFiles int
 	ExcludedDirs  int
@@ -119,7 +122,7 @@ func (w *Walker) Walk(specs []Spec, fn func(Entry) error) (Stats, error) {
 			continue
 		}
 
-		link := info.Mode()&fs.ModeSymlink != 0
+		link := isLink(info)
 		if link && !w.FollowSymlinks {
 			stats.SkippedSymlinks++
 			w.warn(spec.Root, "symlink skipped because followSymlinks is false")
@@ -140,6 +143,12 @@ func (w *Walker) Walk(specs []Spec, fn func(Entry) error) (Stats, error) {
 				w.warn(spec.Root, "symlink target could not be read and was skipped")
 				continue
 			}
+		}
+
+		if isSpecial(info) {
+			stats.SkippedSpecial++
+			w.warn(spec.Root, describeSpecial(info)+" skipped; only files and directories are archived")
+			continue
 		}
 
 		// A source may name a single file rather than a tree. A source-root link
@@ -214,7 +223,7 @@ func (w *Walker) walkDir(spec Spec, absDir, relDir string, ancestry []fs.FileInf
 			continue
 		}
 
-		link := info.Mode()&fs.ModeSymlink != 0
+		link := isLink(info)
 		if link {
 			target, err := os.Stat(abs)
 			if err != nil {
@@ -303,6 +312,13 @@ func (w *Walker) walkDir(spec Spec, absDir, relDir string, ancestry []fs.FileInf
 			w.warn(abs, "symlink skipped because followSymlinks is false")
 			continue
 		}
+		// Checked before anything opens it: opening a FIFO for reading blocks
+		// until something writes to it, which for a backup is forever.
+		if isSpecial(info) {
+			stats.SkippedSpecial++
+			w.warn(abs, describeSpecial(info)+" skipped; only files and directories are archived")
+			continue
+		}
 		info, err = snapshotFileInfo(abs)
 		if err != nil {
 			if perr := w.problem(abs, err); perr != nil {
@@ -329,6 +345,36 @@ func (w *Walker) walkDir(spec Spec, absDir, relDir string, ancestry []fs.FileInf
 		}
 	}
 	return nil
+}
+
+// isLink reports whether an entry stands for something somewhere else.
+//
+// That is a symlink, and on Windows also a junction or any other reparse point
+// that is not one: Lstat reports those as irregular, neither link nor
+// directory. Read as an ordinary file a junction archives as zero bytes under
+// the name of a directory, with no warning – the tree behind it silently
+// missing. Treated as a link it is resolved by Stat and then follows the same
+// followSymlinks policy, and the same loop check, as everything else.
+func isLink(info fs.FileInfo) bool {
+	return info.Mode()&(fs.ModeSymlink|fs.ModeIrregular) != 0
+}
+
+// isSpecial reports whether a resolved entry is neither a file nor a directory.
+func isSpecial(info fs.FileInfo) bool {
+	return !info.IsDir() && !info.Mode().IsRegular()
+}
+
+func describeSpecial(info fs.FileInfo) string {
+	switch mode := info.Mode(); {
+	case mode&fs.ModeNamedPipe != 0:
+		return "named pipe"
+	case mode&fs.ModeSocket != 0:
+		return "socket"
+	case mode&fs.ModeDevice != 0:
+		return "device"
+	default:
+		return "special file"
+	}
 }
 
 // snapshotFileInfo obtains identity from an open handle. On Windows, path Stat

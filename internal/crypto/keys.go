@@ -4,7 +4,7 @@
 //
 // The shape of it is deliberate. The File Master Key is random and is never
 // derived from a passphrase, so changing a passphrase, adding a key file or
-// printing a recovery card rewrites 64 KiB of key slots and leaves a
+// printing a recovery card rewrites 128 KiB of key slots and leaves a
 // terabyte of payload untouched. Everything the container needs is derived
 // from that one key by HKDF, so no two purposes ever share a key.
 package crypto
@@ -24,11 +24,13 @@ const KeyLen = 32
 
 // Domain separation strings. Changing one of these changes the format.
 const (
-	infoData     = "bond/v1/data"
-	infoHeader   = "bond/v1/header"
-	infoManifest = "bond/v1/manifest"
-	infoCommit   = "bond/v1/commit"
-	infoKeyfile  = "bond/v1/keyfile-kek"
+	infoData     = "bond/v2/data"
+	infoHeader   = "bond/v2/header"
+	infoManifest = "bond/v2/manifest"
+	infoCommit   = "bond/v2/commit"
+	infoKeyfile  = "bond/v2/keyfile-kek"
+	infoSlotEnc  = "bond/v2/slot-enc"
+	infoSlotCom  = "bond/v2/slot-com"
 )
 
 // FMK is a container's File Master Key. It is generated once, wrapped by every
@@ -93,8 +95,7 @@ func (k *Keys) FMK() FMK { return k.fmk }
 // finds the key the container was built with or fails outright.
 func (k *Keys) Commitment(containerUUID []byte) []byte {
 	mac := hmac.New(sha256.New, k.Commit)
-	mac.Write([]byte("BOND-COMMIT-V1"))
-	mac.Write(containerUUID)
+	mac.Write(Tuple([]byte(adCommit), containerUUID))
 	return mac.Sum(nil)
 }
 

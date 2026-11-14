@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -44,7 +43,7 @@ func keysUsage() {
        bond keys remove            <container.bond> --slot <label|index|uuid>
        bond keys rotate-passphrase <container.bond>
 
-Every slot wraps the same master key, so all of these rewrite 64 KiB of key
+Every slot wraps the same master key, so all of these rewrite 128 KiB of key
 slots and leave the payload untouched – the same work on a one-gigabyte
 container as on a one-terabyte one. To replace the master key itself, which
 does rewrite everything, use "bond rekey".
@@ -81,13 +80,16 @@ func runKeysList(args []string) error {
 	}
 	defer r.Close()
 
+	// Nothing is unlocked here, so what follows is the slot table as stored and
+	// not as authenticated. It says so, because "bond keys list" is what an
+	// operator looks at to decide which key to fetch from the safe.
 	fmt.Printf("%s\n", operands[0])
-	fmt.Printf("%s\n", ui.Items(len(r.Slots()), "key slot", "key slots"))
+	fmt.Printf("%s, as stored – not authenticated without a key\n", ui.Items(len(r.Slots()), "key slot", "key slots"))
 	for i, s := range r.Slots() {
 		fmt.Printf("\n  [%d] %s\n", i, s.Type)
 		fmt.Printf("      id       %x\n", s.UUID[:8])
 		if s.Label != "" {
-			fmt.Printf("      label    %s\n", s.Label)
+			fmt.Printf("      label    %s\n", s.DisplayLabel())
 		}
 		if s.Type == crypto.SlotPassphrase {
 			fmt.Printf("      argon2id %s memory, %d passes, %d lanes\n",
@@ -157,6 +159,9 @@ func runKeysAdd(args []string) error {
 	if err := confirmPayloadUntouched(r.Paths(), before); err != nil {
 		return err
 	}
+	if err := refreshChecksum(r.Paths()[0]); err != nil {
+		return err
+	}
 
 	fmt.Printf("added         %s slot to %s\n", slot.Type, path)
 	fmt.Printf("key slots     %d\n", len(updated))
@@ -173,6 +178,10 @@ func buildSlot(r *container.Reader, passphrase bool, keyfile, recipient, label s
 	case passphrase:
 		pass, err := ui.ReadPassphrase("New passphrase", true)
 		if err != nil {
+			return nil, err
+		}
+		if err := checkNewPassphrase(pass); err != nil {
+			crypto.Wipe(pass)
 			return nil, err
 		}
 		if label == "" {
@@ -255,7 +264,7 @@ func runKeysRemove(args []string) error {
 	if slots[index].Type == crypto.SlotPlaintext {
 		return fmt.Errorf("this is the plaintext slot of an unencrypted container, and removing it does not make the container encrypted: "+
 			"the master key was stored in it when it was written, so anyone who already has a copy can still open it. "+
-			"Use: bond rekey %s --to <new file>", path)
+			"Use: bond rekey %s --allow-unencrypted --out <new file>", path)
 	}
 
 	// Removing the slot you are holding is a way to lock yourself out of a
@@ -263,7 +272,7 @@ func runKeysRemove(args []string) error {
 	remaining := append(append([]*crypto.Slot(nil), slots[:index]...), slots[index+1:]...)
 	fmt.Printf("removing      [%d] %s", index, slots[index].Type)
 	if slots[index].Label != "" {
-		fmt.Printf(" (%s)", slots[index].Label)
+		fmt.Printf(" (%s)", slots[index].DisplayLabel())
 	}
 	fmt.Printf("\nleaving       %s\n", describeRemaining(remaining))
 	if !yes && !ui.Confirm("Remove it?") {
@@ -278,6 +287,9 @@ func runKeysRemove(args []string) error {
 		return err
 	}
 	if err := confirmPayloadUntouched(r.Paths(), before); err != nil {
+		return err
+	}
+	if err := refreshChecksum(r.Paths()[0]); err != nil {
 		return err
 	}
 
@@ -324,6 +336,9 @@ func runKeysRotate(args []string) error {
 		return err
 	}
 	defer crypto.Wipe(pass)
+	if err := checkNewPassphrase(pass); err != nil {
+		return err
+	}
 	sb := r.Superblock()
 	replacement, err := crypto.NewSlot(sb.Cipher, sb.ContainerUUID, r.Keys().FMK(),
 		crypto.Passphrase(pass), crypto.DefaultKDF, slots[index].Label)
@@ -344,9 +359,27 @@ func runKeysRotate(args []string) error {
 	if err := confirmPayloadUntouched(r.Paths(), before); err != nil {
 		return err
 	}
+	if err := refreshChecksum(r.Paths()[0]); err != nil {
+		return err
+	}
 
 	fmt.Printf("rotated       the passphrase slot of %s\n", path)
 	fmt.Printf("payload       untouched – the master key is unchanged, so nothing was re-encrypted\n")
+	return nil
+}
+
+// refreshChecksum brings the first volume's checksum file up to date after a
+// key change rewrote its key-slot tables. The key change itself has succeeded
+// by the time this runs, so a failure here says exactly that.
+func refreshChecksum(first string) error {
+	sidecar, err := backup.RefreshSidecar(first)
+	if err != nil {
+		return fmt.Errorf("the key slots were changed, but the checksum file next to %s could not be rewritten; "+
+			"\"bond verify --quick\" will report a mismatch until it is: %w", filepath.Base(first), err)
+	}
+	if sidecar != "" {
+		fmt.Printf("checksum      %s rewritten\n", filepath.Base(sidecar))
+	}
 	return nil
 }
 
@@ -409,7 +442,7 @@ func describeRemaining(slots []*crypto.Slot) string {
 	for i, s := range slots {
 		parts[i] = s.Type.String()
 		if s.Label != "" {
-			parts[i] += " (" + s.Label + ")"
+			parts[i] += " (" + s.DisplayLabel() + ")"
 		}
 	}
 	return strings.Join(parts, ", ")
@@ -418,12 +451,22 @@ func describeRemaining(slots []*crypto.Slot) string {
 func runRekey(args []string) error {
 	fs := newFlagSet("rekey")
 	var (
-		out     string
-		workDir string
-		keys    keyFlags
+		out            string
+		workDir        string
+		newPassphrase  bool
+		newKeyfile     string
+		newRecipients  stringList
+		maxVolumeBytes int64
+		signingKey     string
+		keys           keyFlags
 	)
+	fs.StringVar(&signingKey, "signing-key", "", "")
 	fs.StringVar(&out, "out", "", "")
 	fs.StringVar(&workDir, "work-dir", "", "")
+	fs.BoolVar(&newPassphrase, "new-passphrase", false, "")
+	fs.StringVar(&newKeyfile, "new-keyfile", "", "")
+	fs.Var(&newRecipients, "new-recipient", "")
+	fs.Int64Var(&maxVolumeBytes, "max-volume-bytes", -1, "")
 	keys.register(fs)
 	keys.registerShorthand(fs)
 	fs.Usage = func() {
@@ -433,15 +476,27 @@ Writes a copy under a brand new master key. Every shard is sealed again, so
 this rewrites the whole container – hours for a large backup.
 
 This is almost never the operation you want. A passphrase that may have been
-seen is answered by "bond keys rotate-passphrase", which rewrites 64 KiB.
+seen is answered by "bond keys rotate-passphrase", which rewrites 128 KiB.
 Rekeying is for when the master key itself may be exposed, which in practice
 means a restore happened on a machine you no longer trust.
 
-The new container is asked for a new passphrase.
+The new container shares no key with the old one, so its keys are named here.
+With none of the three given, a new passphrase is asked for.
 
 options:
-      --out <file>      where to write the re-encrypted copy
-      --work-dir <dir>  where to assemble it (default: beside --out)
+      --out <file>             where to write the re-encrypted copy
+      --work-dir <dir>         where to assemble it (default: beside --out)
+      --new-passphrase         ask for a passphrase for the new container
+      --new-keyfile <path>     a key file made by "bond keygen --keyfile"
+      --new-recipient <key>    a public key from "bond keygen --recovery-card";
+                               repeat for several
+      --max-volume-bytes <n>   split the copy into volumes of this size; 0 writes
+                               one file (default: no volume larger than the
+                               largest of the container being read)
+      --signing-key <path>     sign the copy with this writer key. A signature
+                               cannot be carried over: the copy is a new container
+
+opening the container being read (any existing key):
 %s
 `, keyFlagHelp)
 	}
@@ -456,8 +511,10 @@ options:
 	if out == "" {
 		return badUsage("name the destination with --out")
 	}
-	if _, err := os.Stat(out); err == nil {
-		return fmt.Errorf("%s already exists", out)
+	for _, taken := range []string{out, out + container.VolumeSuffix(0)} {
+		if _, err := os.Stat(taken); err == nil {
+			return fmt.Errorf("%s already exists", taken)
+		}
 	}
 
 	r, err := openContainer(operands[0], &keys)
@@ -466,12 +523,51 @@ options:
 	}
 	defer r.Close()
 
-	pass, err := ui.ReadPassphrase("Passphrase for the re-encrypted container", true)
-	if err != nil {
-		return err
+	// A rekey used to answer every container with one passphrase slot and one
+	// file: a recipient-only backup came out with a secret it never had, and a
+	// set split for an object store came out as a single file that store would
+	// refuse. What the copy opens with is now said, and its shape follows the
+	// original unless something else is asked for.
+	var specs []container.KeySpec
+	defer func() { wipeKeySpecs(specs) }()
+	if newKeyfile != "" {
+		data, err := os.ReadFile(newKeyfile)
+		if err != nil {
+			return fmt.Errorf("reading the new key file: %w", err)
+		}
+		if len(data) != crypto.KeyLen {
+			crypto.Wipe(data)
+			return fmt.Errorf("%s is %d bytes; a key file is exactly %d", newKeyfile, len(data), crypto.KeyLen)
+		}
+		specs = append(specs, container.KeySpec{Secret: crypto.KeyfileSecret(data), Label: filepath.Base(newKeyfile)})
 	}
-	defer crypto.Wipe(pass)
-	specs := []container.KeySpec{{Secret: crypto.Passphrase(pass), KDF: crypto.DefaultKDF, Label: "passphrase"}}
+	for _, key := range newRecipients {
+		pub, err := decodeRecipientPublic(key)
+		if err != nil {
+			return err
+		}
+		specs = append(specs, container.KeySpec{Recipient: pub, Label: "recovery key"})
+	}
+	if newPassphrase || len(specs) == 0 {
+		pass, err := ui.ReadPassphrase("Passphrase for the re-encrypted container", true)
+		if err != nil {
+			return err
+		}
+		if err := checkNewPassphrase(pass); err != nil {
+			crypto.Wipe(pass)
+			return err
+		}
+		specs = append(specs, container.KeySpec{Secret: crypto.Passphrase(pass), KDF: crypto.DefaultKDF, Label: "passphrase"})
+	}
+
+	if maxVolumeBytes < 0 {
+		maxVolumeBytes = 0
+		if paths := r.Paths(); len(paths) > 1 {
+			for _, p := range paths {
+				maxVolumeBytes = max(maxVolumeBytes, fileSize(p))
+			}
+		}
+	}
 
 	if workDir == "" {
 		workDir = filepath.Dir(out)
@@ -483,12 +579,39 @@ options:
 	fmt.Printf("container     %s\n", operands[0])
 	fmt.Printf("payload       %s to re-encrypt\n", ui.Bytes(int64(r.Superblock().PayloadBytes())))
 
-	result, err := backup.Rekey(context.Background(), r, out, specs, false, workDir, 0)
+	var signer *crypto.WriterPrivate
+	if signingKey != "" {
+		if signer, err = loadWriterKey(signingKey); err != nil {
+			return err
+		}
+		defer signer.Wipe()
+	} else if r.Signer() != nil {
+		fmt.Fprintf(os.Stderr, "warning: the container being read is signed by writer %s, and the copy will not be; "+
+			"give --signing-key to sign it\n", shortID(r.Signer()))
+	}
+
+	result, err := backup.Rekey(rootCtx, r, out, specs, false, workDir, maxVolumeBytes, signer)
 	if err != nil {
 		return err
 	}
 
 	fmt.Printf("written       %s (%s) in %s\n", result.Path, ui.Bytes(result.Size), result.Elapsed.Round(time.Millisecond))
+	if result.Volumes > 1 {
+		fmt.Printf("volumes       %s\n", ui.Items(result.Volumes, "file", "files"))
+	}
+	if n := r.RecoveredShards(); n > 0 {
+		fmt.Printf("damaged       %s of the old container were rebuilt from its recovery data while reading\n", ui.Items(n, "shard", "shards"))
+	}
+	// The copy gets checksum files when the original had them, one per volume.
+	if algorithm := backup.SidecarAlgorithm(r.Paths()[0]); algorithm != "" {
+		for _, p := range result.Paths {
+			sidecar, err := backup.WriteSidecar(p, algorithm)
+			if err != nil {
+				return fmt.Errorf("writing the checksum file: %w", err)
+			}
+			fmt.Printf("checksum      %s\n", filepath.Base(sidecar))
+		}
+	}
 	fmt.Printf("\nThe old container still opens with its old keys. Delete it only once the\n")
 	fmt.Printf("new one has been verified and restored from at least once.\n")
 	return nil

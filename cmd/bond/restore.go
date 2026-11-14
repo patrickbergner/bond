@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -11,6 +10,7 @@ import (
 	"github.com/patrickbergner/bond/internal/archive"
 	"github.com/patrickbergner/bond/internal/backup"
 	"github.com/patrickbergner/bond/internal/container"
+	"github.com/patrickbergner/bond/internal/crypto"
 	"github.com/patrickbergner/bond/internal/sevenzip"
 	"github.com/patrickbergner/bond/internal/ui"
 )
@@ -91,7 +91,7 @@ options:
 	fmt.Printf("restoring   into %s\n", dest)
 
 	progress := ui.NewProgress(os.Stderr)
-	result, err := backup.Restore(context.Background(), r, backup.RestoreOptions{
+	result, err := backup.Restore(rootCtx, r, backup.RestoreOptions{
 		Dest:      dest,
 		Include:   include,
 		Overwrite: overwrite,
@@ -100,7 +100,7 @@ options:
 			progress.Add(fi.Size)
 			if verbose {
 				progress.Clear()
-				fmt.Printf("  %s\n", fi.Path)
+				fmt.Printf("  %s\n", ui.Path(fi.Path))
 			}
 		},
 		OnWarning: func(path, msg string) {
@@ -133,9 +133,23 @@ options:
 		fmt.Printf("skipped     %s\n", ui.Items(result.Stats.Skipped, "entry", "entries"))
 	}
 	if result.Verified > 0 {
-		fmt.Printf("verified    %s match the digests recorded at backup time\n", ui.Items(result.Verified, "file", "files"))
+		fmt.Printf("verified    %s the digests recorded at backup time\n", matches(result.Verified))
+	}
+	// The restore is whole, but the container it came from is not. Saying so
+	// here is the only notice an operator gets before the next shard goes.
+	if n := r.RecoveredShards(); n > 0 {
+		fmt.Printf("damaged     %s could not be read and were rebuilt from the recovery data;\n", ui.Items(n, "shard", "shards"))
+		fmt.Printf("            the container itself is still damaged – run: bond repair %s\n", operands[0])
 	}
 	return err
+}
+
+// matches agrees the verb with its count: "1 file matches", "2 files match".
+func matches(n int) string {
+	if n == 1 {
+		return ui.Items(n, "file", "files") + " matches"
+	}
+	return ui.Items(n, "file", "files") + " match"
 }
 
 func runList(args []string) error {
@@ -179,14 +193,41 @@ options:
 	for _, e := range entries {
 		switch {
 		case !long:
-			fmt.Println(e.Path)
+			fmt.Println(ui.Path(e.Path))
 		case e.Kind == archive.KindDir:
-			fmt.Printf("%-10s  %-19s  %s/\n", "", e.ModTime.Format(time.DateTime), e.Path)
+			fmt.Printf("%-10s  %-19s  %s/\n", "", e.ModTime.Format(time.DateTime), ui.Path(e.Path))
 		default:
-			fmt.Printf("%10s  %-19s  %s\n", ui.Bytes(e.Size), e.ModTime.Format(time.DateTime), e.Path)
+			fmt.Printf("%10s  %-19s  %s\n", ui.Bytes(e.Size), e.ModTime.Format(time.DateTime), ui.Path(e.Path))
 		}
 	}
 	return nil
+}
+
+// reportProvenance says on standard error what is known about who wrote a
+// container that has just been unlocked. It is quiet only where the key used
+// itself proves something: a passphrase or key file cannot be used to write a
+// container without being known.
+func reportProvenance(r *container.Reader, keys *keyFlags) {
+	switch {
+	case r.WriterChecked():
+		fmt.Fprintf(os.Stderr, "note: signed by the expected writer %s\n", shortID(r.Signer()))
+	case keys.allowUnencrypted:
+		fmt.Fprintln(os.Stderr, "note: opened with the key stored in the container; it is unencrypted, and nothing proves who wrote it")
+	case r.OpenedWith() == crypto.SlotRecipient && r.Signer() != nil:
+		fmt.Fprintf(os.Stderr, "note: opened with a recovery key; the container says it is signed by writer %s, "+
+			"which was not checked – give --expect-writer to check it\n", shortID(r.Signer()))
+	case r.OpenedWith() == crypto.SlotRecipient:
+		fmt.Fprintln(os.Stderr, "warning: opened with a recovery key, and the container is not signed. Anyone who has the "+
+			"public key could have written it; restore it only if you trust where it came from")
+	}
+}
+
+// shortID is the part of a writer fingerprint a person compares.
+func shortID(id []byte) string {
+	if len(id) < 8 {
+		return fmt.Sprintf("%x", id)
+	}
+	return fmt.Sprintf("%x", id[:8])
 }
 
 // openContainer opens and unlocks a container, asking only for the kinds of
@@ -205,9 +246,15 @@ func openContainer(path string, keys *keyFlags) (*container.Reader, error) {
 	if keys.allowExpensiveKDF {
 		fmt.Fprintln(os.Stderr, "warning: --allow-expensive-kdf permits unauthenticated container data to request extreme memory or CPU")
 	}
-	if err := r.UnlockWithOptions(keys.unlockOptions(), secrets...); err != nil {
+	opts, err := keys.unlockOptions()
+	if err != nil {
 		r.Close()
 		return nil, err
 	}
+	if err := r.UnlockWithOptions(opts, secrets...); err != nil {
+		r.Close()
+		return nil, err
+	}
+	reportProvenance(r, keys)
 	return r, nil
 }

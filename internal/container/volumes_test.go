@@ -2,6 +2,7 @@ package container
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"io"
 	"os"
@@ -210,7 +211,7 @@ func TestSplitContainerRepairs(t *testing.T) {
 	}
 
 	repaired := filepath.Join(t.TempDir(), "repaired.bond")
-	if _, err := Repair(r, repaired, report, nil); err != nil {
+	if _, err := Repair(context.Background(), r, repaired, report, nil); err != nil {
 		t.Fatalf("Repair: %v", err)
 	}
 
@@ -474,7 +475,7 @@ func TestVolumeWithAForgedHeaderIsRefused(t *testing.T) {
 }
 
 // The key slots live in the first volume, and every slot wraps the same master
-// key, so a key change is 64 KiB of writing whatever the container is stored in.
+// key, so a key change is 128 KiB of writing whatever the container is stored in.
 // The proof that the payload was untouched has to cover every volume of it.
 func TestKeyChangeOnASplitContainerLeavesThePayloadAlone(t *testing.T) {
 	const limit = format.PayloadOffset + (400 << 10)
@@ -598,7 +599,7 @@ func TestRepairRestoresRequiredMirrors(t *testing.T) {
 
 	// Heal the metadata and prove the mirrors are appended without eating payload.
 	fixed := filepath.Join(t.TempDir(), "fixed.bond")
-	out, err := copySet(r.vols, fixed)
+	out, err := copySet(context.Background(), r.vols, fixed)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -625,5 +626,94 @@ func TestRepairRestoresRequiredMirrors(t *testing.T) {
 	}
 	if got := readAll(t, again); !bytes.Equal(got, payload) {
 		t.Error("healing the headers of an older container destroyed payload")
+	}
+}
+
+// A set of many volumes is read and written without holding a descriptor per
+// file: the process limit on open files is far lower than the number of volumes
+// a large backup under a small volume limit comes to.
+func TestManyVolumesAreNotAllHeldOpen(t *testing.T) {
+	payload := make([]byte, 3<<20)
+	rand.Read(payload)
+	base := filepath.Join(t.TempDir(), "many.bond")
+	w, err := Create(base, Options{
+		ShardSize:       8192,
+		RecoveryPercent: 10,
+		MaxVolumeBytes:  205000,
+		Keys:            []KeySpec{{Secret: crypto.Passphrase(testPass), KDF: fastKDF}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Destroy()
+	if _, err := w.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	stillOpen := 0
+	for _, vf := range w.vols.files {
+		if vf.f != nil {
+			stillOpen++
+		}
+	}
+	if len(w.vols.files) < 3*maxOpenVolumes || stillOpen != 1 {
+		t.Fatalf("writing %d volumes with %d files open; want many volumes and one open file", len(w.vols.files), stillOpen)
+	}
+	if err := w.Finish(&format.Manifest{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Validate(base + VolumeSuffix(0)); err != nil {
+		t.Fatalf("the finished set does not read back: %v", err)
+	}
+
+	// Entered through a volume in the middle, and read to the end.
+	r := openUnlocked(t, base+VolumeSuffix(20))
+	defer r.Close()
+	if got := readAll(t, r); !bytes.Equal(got, payload) {
+		t.Fatal("the payload did not come back from a set of many volumes")
+	}
+	report, err := r.Verify(nil)
+	if err != nil || !report.Healthy() {
+		t.Fatalf("Verify: %+v, %v", report, err)
+	}
+	held := 0
+	for _, v := range r.vols.vols {
+		if v.f != nil {
+			held++
+		}
+	}
+	if held > maxOpenVolumes {
+		t.Errorf("the reader holds %d of %d volumes open, limit %d", held, r.Volumes(), maxOpenVolumes)
+	}
+}
+
+// A numeric suffix is a volume number only when the set it would belong to is
+// there. "photos.2026" on its own is a file called photos.2026.
+func TestSetBaseDoesNotMistakeANameForAVolume(t *testing.T) {
+	dir := t.TempDir()
+	touch := func(name string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	lone := touch("photos.2026")
+	if got := SetBase(lone); got != lone {
+		t.Errorf("SetBase(%s) = %s; a lone file is its own base", filepath.Base(lone), filepath.Base(got))
+	}
+	if files, err := VolumeFiles(lone); err != nil || len(files) != 1 || files[0] != lone {
+		t.Errorf("VolumeFiles of a lone numbered name = %v, %v", files, err)
+	}
+
+	first, third := touch("set.bond.001"), touch("set.bond.003")
+	touch("set.bond.002")
+	want := filepath.Join(dir, "set.bond")
+	for _, p := range []string{first, third} {
+		if got := SetBase(p); got != want {
+			t.Errorf("SetBase(%s) = %s, want %s", filepath.Base(p), filepath.Base(got), filepath.Base(want))
+		}
+	}
+	if got := SetBase(filepath.Join(dir, "absent.bond.004")); got != filepath.Join(dir, "absent.bond") {
+		t.Errorf("a path that does not exist goes by its name, got %s", got)
 	}
 }

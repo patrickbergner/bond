@@ -2,9 +2,11 @@ package container
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -210,7 +212,7 @@ func TestRepairRebuildsDamagedShards(t *testing.T) {
 			}
 
 			repaired := filepath.Join(t.TempDir(), "repaired.bond")
-			result, err := Repair(r, repaired, report, nil)
+			result, err := Repair(context.Background(), r, repaired, report, nil)
 			if err != nil {
 				t.Fatalf("Repair: %v", err)
 			}
@@ -269,7 +271,7 @@ func TestRepairRefusesDamageBeyondCapacity(t *testing.T) {
 	}
 
 	dst := filepath.Join(t.TempDir(), "attempt.bond")
-	if _, err := Repair(r, dst, report, nil); err == nil {
+	if _, err := Repair(context.Background(), r, dst, report, nil); err == nil {
 		t.Fatal("Repair claimed to rebuild more than the parity covers")
 	} else if !strings.Contains(err.Error(), "beyond what the recovery data covers") {
 		t.Errorf("error = %v, want it to explain the limit", err)
@@ -303,7 +305,7 @@ func TestRepairCapacityIsPerStripe(t *testing.T) {
 	}
 
 	repaired := filepath.Join(t.TempDir(), "repaired.bond")
-	if _, err := Repair(r, repaired, report, nil); err != nil {
+	if _, err := Repair(context.Background(), r, repaired, report, nil); err != nil {
 		t.Fatalf("Repair: %v", err)
 	}
 
@@ -333,7 +335,7 @@ func TestRepairRefusedWithoutRecoveryData(t *testing.T) {
 	}
 
 	dst := filepath.Join(t.TempDir(), "attempt.bond")
-	if _, err := Repair(r, dst, report, nil); err == nil {
+	if _, err := Repair(context.Background(), r, dst, report, nil); err == nil {
 		t.Fatal("Repair succeeded on a container with no recovery data")
 	} else if !strings.Contains(err.Error(), "no recovery data") {
 		t.Errorf("error = %v, want it to say there is nothing to rebuild from", err)
@@ -358,7 +360,7 @@ func TestRepairLeavesTheOriginalAlone(t *testing.T) {
 	r := openUnlocked(t, path)
 	report, _ := r.Verify(nil)
 	dst := filepath.Join(t.TempDir(), "repaired.bond")
-	if _, err := Repair(r, dst, report, nil); err != nil {
+	if _, err := Repair(context.Background(), r, dst, report, nil); err != nil {
 		t.Fatalf("Repair: %v", err)
 	}
 
@@ -410,7 +412,7 @@ func TestRepairAgainstRandomDamage(t *testing.T) {
 		}
 
 		repaired := filepath.Join(t.TempDir(), "repaired.bond")
-		if _, err := Repair(r, repaired, report, nil); err != nil {
+		if _, err := Repair(context.Background(), r, repaired, report, nil); err != nil {
 			t.Fatalf("round %d: Repair: %v", round, err)
 		}
 		fixed, err := Open(repaired)
@@ -466,7 +468,7 @@ func TestParityOnATinyContainer(t *testing.T) {
 		t.Fatalf("a one-shard container with one parity shard was called unrepairable: %+v", report)
 	}
 	repaired := filepath.Join(t.TempDir(), "repaired.bond")
-	if _, err := Repair(r, repaired, report, nil); err != nil {
+	if _, err := Repair(context.Background(), r, repaired, report, nil); err != nil {
 		t.Fatalf("Repair: %v", err)
 	}
 	fixed, _ := Open(repaired)
@@ -523,11 +525,102 @@ func TestRepairRefusesAShardThatChangedSinceTheCheck(t *testing.T) {
 	wreckData(t, path, r.Superblock(), 1)
 
 	fixed := filepath.Join(t.TempDir(), "fixed.bond")
-	_, err = Repair(r, fixed, report, nil)
+	_, err = Repair(context.Background(), r, fixed, report, nil)
 	if err == nil {
 		t.Fatal("a repair ran on a shard that no longer authenticates")
 	}
 	if !strings.Contains(err.Error(), "shard 1") {
 		t.Errorf("error = %v, want it to name the shard that changed", err)
+	}
+}
+
+// The manifest is stored twice so that losing one copy costs nothing. That only
+// holds if the loss is noticed: a reader that takes the first copy that opens
+// and says nothing leaves a container one flip from an uninterpretable payload,
+// and a repair that never hears about it never puts the copy back.
+func TestDamagedManifestCopyIsReportedAndRepaired(t *testing.T) {
+	for copyIndex, name := range []string{"first", "second"} {
+		t.Run(name, func(t *testing.T) {
+			path := build(t, bytes.Repeat([]byte("manifest"), 4000), Options{ShardSize: 8192})
+
+			probe := openUnlocked(t, path)
+			tailOffset := int64(probe.Superblock().TailOffset)
+			tailLength := int64(probe.Superblock().TailLength)
+			if n := probe.Notices(); len(n) != 0 {
+				t.Fatalf("a fresh container reports damage: %v", n)
+			}
+			probe.Close()
+
+			f, err := os.OpenFile(path, os.O_RDWR, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.WriteAt([]byte{0xde, 0xad, 0xbe, 0xef}, tailOffset+int64(copyIndex)*tailLength+tailLength/2); err != nil {
+				t.Fatal(err)
+			}
+			f.Close()
+
+			r := openUnlocked(t, path)
+			defer r.Close()
+			notices := r.Notices()
+			if len(notices) != 1 || !strings.Contains(notices[0], "the "+name+" copy of the manifest") {
+				t.Fatalf("notices = %q, want one naming the %s manifest copy", notices, name)
+			}
+
+			report, err := r.Verify(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixed := filepath.Join(t.TempDir(), "fixed.bond")
+			result, err := Repair(context.Background(), r, fixed, report, nil)
+			if err != nil {
+				t.Fatalf("Repair: %v", err)
+			}
+			if !slices.ContainsFunc(result.Metadata, func(s string) bool { return strings.Contains(s, "manifest") }) {
+				t.Errorf("the repair did not say it rewrote the manifest: %v", result.Metadata)
+			}
+
+			again := openUnlocked(t, fixed)
+			defer again.Close()
+			if n := again.Notices(); len(n) != 0 {
+				t.Errorf("the repaired container still reports damage: %v", n)
+			}
+		})
+	}
+}
+
+// A repair that does not complete leaves nothing under the destination name or
+// beside it.
+func TestInterruptedRepairLeavesNothingBehind(t *testing.T) {
+	path := build(t, bytes.Repeat([]byte("staging"), 4000), Options{ShardSize: 8192})
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, _ := f.Stat()
+	if _, err := f.WriteAt([]byte{1, 2, 3, 4}, info.Size()-100); err != nil { // the mirrored header
+		t.Fatal(err)
+	}
+	f.Close()
+
+	r := openUnlocked(t, path)
+	defer r.Close()
+	report, err := r.Verify(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	dir := t.TempDir()
+	if _, err := Repair(ctx, r, filepath.Join(dir, "fixed.bond"), report, nil); err == nil {
+		t.Fatal("a cancelled repair reported success")
+	}
+	left, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(left) != 0 {
+		t.Errorf("a cancelled repair left %d files behind, the first being %s", len(left), left[0].Name())
 	}
 }

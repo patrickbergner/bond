@@ -2,7 +2,10 @@ package source
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -430,4 +433,90 @@ func walkNoFatal(t *testing.T, spec config.Source, w *Walker) (Stats, error) {
 		return Stats{}, err
 	}
 	return w.Walk(specs, func(Entry) error { return nil })
+}
+
+// A Windows junction is neither a symlink nor a directory to Lstat. Read as a
+// file it archived as zero bytes under a directory's name, with no warning.
+func TestJunctionFollowsTheLinkPolicy(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("junctions are a Windows construct")
+	}
+	root := tree(t)
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "inside.txt"), []byte("12345"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	junction := filepath.Join(root, "junction")
+	if out, err := exec.Command("cmd", "/c", "mklink", "/J", junction, outside).CombinedOutput(); err != nil {
+		t.Skipf("cannot create a junction here: %v: %s", err, out)
+	}
+
+	entries, stats := walk(t, config.Source{Path: root}, &Walker{FollowSymlinks: true})
+	kinds := map[string]Entry{}
+	for _, e := range entries {
+		kinds[e.Archive] = e
+	}
+	if e, ok := kinds["tools/junction"]; !ok || e.Kind != KindDir {
+		t.Errorf("the junction was stored as %+v, want a directory", e)
+	}
+	if e, ok := kinds["tools/junction/inside.txt"]; !ok || e.Kind != KindFile || e.Size != 5 {
+		t.Errorf("the file behind the junction was stored as %+v, want its 5 bytes", e)
+	}
+	if stats.SkippedSymlinks != 0 {
+		t.Errorf("followed junction counted as skipped: %+v", stats)
+	}
+
+	warnings := 0
+	entries, stats = walk(t, config.Source{Path: root}, &Walker{OnWarning: func(string, string) { warnings++ }})
+	for _, e := range entries {
+		if strings.HasPrefix(e.Archive, "tools/junction") {
+			t.Errorf("%s was stored although followSymlinks is off", e.Archive)
+		}
+	}
+	if stats.SkippedSymlinks != 1 || warnings != 1 {
+		t.Errorf("skipped = %d, warnings = %d; want one of each", stats.SkippedSymlinks, warnings)
+	}
+}
+
+// Opening a FIFO for reading blocks until something writes to it. The walk has
+// to recognise one before it opens anything, and say that it left it out.
+func TestSpecialFilesAreSkippedWithoutBeingOpened(t *testing.T) {
+	root := tree(t)
+	if err := makeFIFO(filepath.Join(root, "pipe")); err != nil {
+		t.Skipf("cannot create a FIFO here: %v", err)
+	}
+
+	var warned []string
+	entries, stats := walk(t, config.Source{Path: root}, &Walker{
+		FollowSymlinks: true,
+		OnWarning:      func(path, msg string) { warned = append(warned, msg) },
+	})
+	for _, e := range entries {
+		if e.Archive == "tools/pipe" {
+			t.Fatal("a FIFO was handed to the archive writer")
+		}
+	}
+	if stats.SkippedSpecial != 1 || len(warned) != 1 || !strings.Contains(warned[0], "named pipe") {
+		t.Errorf("skipped special = %d, warnings = %q; want one named pipe", stats.SkippedSpecial, warned)
+	}
+}
+
+// A name that is not UTF-8 is a file like any other: it is walked, and the
+// index stores its bytes.
+func TestNameThatIsNotUTF8IsWalked(t *testing.T) {
+	root := tree(t)
+	if err := os.WriteFile(filepath.Join(root, "caf\xe9.txt"), []byte("x"), 0o644); err != nil {
+		t.Skipf("this filesystem does not take a non-UTF-8 name: %v", err)
+	}
+	if names, err := os.ReadDir(root); err != nil || !slices.ContainsFunc(names, func(d os.DirEntry) bool { return d.Name() == "caf\xe9.txt" }) {
+		t.Skip("this filesystem rewrote the name")
+	}
+
+	entries, _ := walk(t, config.Source{Path: root}, &Walker{})
+	if !slices.ContainsFunc(entries, func(e Entry) bool { return e.Archive == "tools/caf\xe9.txt" }) {
+		t.Error("the file with a non-UTF-8 name was not walked under its own name")
+	}
 }

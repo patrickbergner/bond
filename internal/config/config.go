@@ -107,6 +107,7 @@ type Settings struct {
 	FollowSymlinks   *bool     `json:"followSymlinks,omitempty"`
 	OutputPath       *string   `json:"outputPath,omitempty"`
 	WorkPath         *string   `json:"workPath,omitempty"`
+	SigningKey       *string   `json:"signingKey,omitempty"`
 }
 
 // KeySlot is an additional way to unlock a container.
@@ -130,6 +131,10 @@ type Resolved struct {
 	FollowSymlinks   bool
 	OutputPath       string
 	WorkPath         string
+
+	// SigningKey is the path of a writer key file, or empty for unsigned
+	// containers.
+	SigningKey string
 }
 
 // Defaults are the built-in settings, used for anything the control file omits.
@@ -436,6 +441,7 @@ func validateSettings(where string, s *Settings) []string {
 	}{
 		{"outputPath", s.OutputPath},
 		{"workPath", s.WorkPath},
+		{"signingKey", s.SigningKey},
 	} {
 		if f.value == nil {
 			continue
@@ -505,6 +511,9 @@ func merge(base Resolved, s *Settings) Resolved {
 	}
 	if s.WorkPath != nil {
 		out.WorkPath = *s.WorkPath
+	}
+	if s.SigningKey != nil {
+		out.SigningKey = *s.SigningKey
 	}
 	return out
 }

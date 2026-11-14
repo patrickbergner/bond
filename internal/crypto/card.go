@@ -76,42 +76,77 @@ func EncodeRecoveryKey(seed []byte) (string, error) {
 
 // DecodeRecoveryKey reads a recovery key back, whatever the operator's
 // keyboard, case or hyphenation did to it.
+//
+// It is forgiving about how the key was typed and strict about what it is.
+// Separators and case are ignored and the confusable letters are read as the
+// digits they stand for; but the key has to be exactly as long as a key is,
+// its unused trailing bits have to be zero, and its checksum has to match. A
+// decoder that accepted anything longer would read "the key, and then some
+// more" as the key – and a line pasted with something stuck to its end is a
+// mistake worth hearing about, not one to guess through.
 func DecodeRecoveryKey(s string) ([]byte, error) {
-	cleaned := make([]byte, 0, len(s))
+	// Everything is brought to the canonical alphabet first, the prefix
+	// included, so "B0ND-R1" with a zero is the prefix as much as "BOND-R1" is.
+	canonical := make([]byte, 0, len(s))
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		switch {
-		case c == '-' || c == ' ' || c == '\t' || c == '\r' || c == '\n':
+		if c == '-' || c == ' ' || c == '\t' || c == '\r' || c == '\n' {
 			continue
-		default:
-			cleaned = append(cleaned, c)
 		}
+		v := cardDecodeTable[c]
+		if v < 0 {
+			return nil, fmt.Errorf("%q is not a character a recovery key can contain", string(c))
+		}
+		canonical = append(canonical, cardAlphabet[v])
 	}
 
-	// The prefix is matched with its hyphen already removed, like everything
-	// else here. It is optional on the way in: someone who copied only the
-	// body of the key has not made a mistake worth refusing.
-	upper := strings.ToUpper(string(cleaned))
-	bare := strings.ReplaceAll(CardPrefix, "-", "")
-	trimmed := strings.TrimPrefix(upper, bare)
-	if trimmed == upper && strings.HasPrefix(upper, "BOND") {
+	const bodyLen = (SeedLen+cardChecksumLen)*8/5 + 1 // 55 characters for 34 bytes
+	prefix := canonicalCard(CardPrefix)
+	family := canonicalCard("BOND")
+
+	// The prefix is optional on the way in: someone who copied only the body of
+	// the key has not made a mistake worth refusing. Which of the two this is
+	// follows from the length, never from what the first characters happen to
+	// spell.
+	body := string(canonical)
+	switch {
+	case len(body) == bodyLen:
+	case len(body) == bodyLen+len(prefix) && strings.HasPrefix(body, prefix):
+		body = body[len(prefix):]
+	case len(body) == bodyLen+len(prefix) && strings.HasPrefix(body, family):
 		return nil, fmt.Errorf("this looks like a recovery key from another version of BOND; this build reads %s", CardPrefix)
+	case len(body) < bodyLen:
+		return nil, fmt.Errorf("this recovery key is too short: %d characters where %d are expected", len(body), bodyLen)
+	default:
+		return nil, fmt.Errorf("this recovery key is too long: %d characters where %d are expected (%d with the %s prefix)",
+			len(body), bodyLen, bodyLen+len(prefix), CardPrefix)
 	}
 
-	decoded, err := base32Decode(trimmed)
+	decoded, spare, err := base32Decode(body)
 	if err != nil {
 		return nil, err
 	}
-	if len(decoded) < SeedLen+cardChecksumLen {
-		return nil, fmt.Errorf("this recovery key is too short: %d characters where %d are expected",
-			len(trimmed), base32Len(SeedLen+cardChecksumLen))
+	if spare != 0 || len(decoded) != SeedLen+cardChecksumLen {
+		return nil, fmt.Errorf("this recovery key does not check out; a character was probably misread")
 	}
-	seed, sum := decoded[:SeedLen], decoded[SeedLen:SeedLen+cardChecksumLen]
+	seed, sum := decoded[:SeedLen], decoded[SeedLen:]
 
 	if subtle.ConstantTimeCompare(sum, cardChecksum(seed)) != 1 {
 		return nil, fmt.Errorf("this recovery key does not check out; a character was probably misread")
 	}
 	return seed, nil
+}
+
+// canonicalCard maps text through the decoder's own table, so a prefix is
+// compared in the form typed keys are brought to.
+func canonicalCard(text string) string {
+	out := make([]byte, 0, len(text))
+	for i := 0; i < len(text); i++ {
+		if v := cardDecodeTable[text[i]]; v >= 0 {
+			out = append(out, cardAlphabet[v])
+		}
+	}
+	return string(out)
 }
 
 // cardChecksum is what catches a transcription slip. Two bytes is not
@@ -143,14 +178,18 @@ func base32Encode(b []byte) string {
 	return out.String()
 }
 
-func base32Decode(s string) ([]byte, error) {
-	out := make([]byte, 0, len(s)*5/8)
+// base32Decode returns the bytes and whatever bits were left over at the end.
+// A whole number of bytes rarely fills a whole number of characters, so the last
+// character carries a few unused bits; an encoder writes them as zero, and the
+// caller treats anything else as a misread character.
+func base32Decode(s string) (out []byte, spare uint32, err error) {
+	out = make([]byte, 0, len(s)*5/8)
 
 	var buf, bits uint32
 	for i := 0; i < len(s); i++ {
 		v := cardDecodeTable[s[i]]
 		if v < 0 {
-			return nil, fmt.Errorf("%q is not a character a recovery key can contain", string(s[i]))
+			return nil, 0, fmt.Errorf("%q is not a character a recovery key can contain", string(s[i]))
 		}
 		buf = buf<<5 | uint32(v)
 		bits += 5
@@ -159,5 +198,5 @@ func base32Decode(s string) ([]byte, error) {
 			out = append(out, byte(buf>>bits))
 		}
 	}
-	return out, nil
+	return out, buf & (1<<bits - 1), nil
 }

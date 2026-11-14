@@ -39,6 +39,9 @@ type CreateOptions struct {
 	OutputPath string
 	Tool       *sevenzip.Tool
 
+	// Signer, if set, signs the container (Settings.SigningKey, loaded).
+	Signer *crypto.WriterPrivate
+
 	OnEntry   func(archive.Entry)
 	OnWarning func(path, msg string)
 	OnProblem func(path string, err error) error
@@ -75,8 +78,8 @@ func (r *CreateResult) Ratio() float64 {
 // The whole pipeline is one pass with nothing buffered to disk: files are
 // walked into a tar, the tar goes through 7-Zip's xz encoder, the compressed
 // bytes are sealed into shards as they arrive, and the header is patched at
-// the end. A backup of a terabyte therefore needs a terabyte of destination
-// and nothing else.
+// the end. A backup of a terabyte therefore needs a terabyte of space on the
+// destination's filesystem, where it is staged and renamed, and nothing else.
 func Create(ctx context.Context, opts CreateOptions) (*CreateResult, error) {
 	started := time.Now()
 
@@ -103,6 +106,7 @@ func Create(ctx context.Context, opts CreateOptions) (*CreateResult, error) {
 		Unencrypted:     opts.Unencrypted,
 		RecoveryPercent: opts.Settings.RecoveryPercent,
 		MaxVolumeBytes:  opts.Settings.MaxVolumeBytes,
+		Signer:          opts.Signer,
 	})
 	if err != nil {
 		return nil, err
@@ -286,6 +290,24 @@ func confirmReadable(path string, keys []container.KeySpec) error {
 // Without parity there is no stripe to fill and the configured size stands.
 func shardSizeFor(opts CreateOptions, specs []source.Spec, plan parity.Plan) (int64, error) {
 	configured := opts.Settings.ShardBytes
+
+	// A volume never splits a shard, so one that is larger than a volume's
+	// payload budget makes every volume larger than maxVolumeBytes – silently,
+	// and the object store the limit was set for then refuses the upload. The
+	// shard is cut to fit instead. A parity shard is one tag longer than a data
+	// shard, which is what the 16 bytes are for.
+	if opts.Settings.MaxVolumeBytes > 0 {
+		limit, err := container.VolumePayloadLimit(opts.Settings.MaxVolumeBytes)
+		if err != nil {
+			return 0, err
+		}
+		fits := (limit - crypto.TagLen) / 4096 * 4096
+		if fits < minShardBytes {
+			return 0, fmt.Errorf("maxVolumeBytes of %d cannot hold a single shard of the smallest size (%d bytes)",
+				opts.Settings.MaxVolumeBytes, minShardBytes)
+		}
+		configured = min(configured, fits)
+	}
 	if !plan.Enabled() {
 		return configured, nil
 	}
@@ -302,10 +324,12 @@ func shardSizeFor(opts CreateOptions, specs []source.Spec, plan parity.Plan) (in
 		estimate = stats.Bytes
 	}
 
-	const minShard = 64 << 10
 	want := (estimate/int64(plan.Data) + 4095) / 4096 * 4096
-	return max(minShard, min(configured, want)), nil
+	return max(minShardBytes, min(configured, want)), nil
 }
+
+// minShardBytes is the smallest shard a backup is written with.
+const minShardBytes = 64 << 10
 
 // archiveKind translates between the two packages' entry kinds. They happen to
 // use the same order, but writing it out means a new kind in one of them
@@ -395,6 +419,52 @@ func WriteSidecar(path, algorithm string) (string, error) {
 		return "", err
 	}
 	if err := fout.Close(); err != nil {
+		return "", err
+	}
+	return sidecar, nil
+}
+
+// SidecarAlgorithm reports which checksum file, if any, sits next to a
+// container file.
+func SidecarAlgorithm(path string) string {
+	for _, c := range []struct{ ext, alg string }{
+		{".sha256", config.HashSHA256},
+		{".sha384", config.HashSHA384},
+		{".sha512", config.HashSHA512},
+	} {
+		if _, err := os.Stat(path + c.ext); err == nil {
+			return c.alg
+		}
+	}
+	return ""
+}
+
+// RefreshSidecar recomputes the checksum file of a container file that has
+// just been changed in place, which is what a key change does to the first
+// volume. Without it the checksum goes on describing bytes that are no longer
+// there, and the next quick check reports an intact container as damaged.
+//
+// It returns "" when the file has no checksum file: none is invented.
+func RefreshSidecar(path string) (string, error) {
+	algorithm := SidecarAlgorithm(path)
+	if algorithm == "" {
+		return "", nil
+	}
+	sum, err := hashFile(path, algorithm)
+	if err != nil {
+		return "", err
+	}
+	sidecar := path + "." + strings.ToLower(algorithm)
+	line := fmt.Sprintf("%s  %s\n", sum, filepath.Base(path))
+
+	// Written beside the old one and renamed over it, so an interruption leaves
+	// either checksum file whole rather than half of one.
+	tmp := sidecar + ".new"
+	if err := os.WriteFile(tmp, []byte(line), 0o644); err != nil {
+		return "", err
+	}
+	if err := os.Rename(tmp, sidecar); err != nil {
+		os.Remove(tmp)
 		return "", err
 	}
 	return sidecar, nil

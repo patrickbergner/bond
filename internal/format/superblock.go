@@ -16,7 +16,7 @@ import (
 )
 
 // Sizes and fixed offsets. The regions before the payload have a constant
-// length so that changing a key rewrites a known 64 KiB and never moves a byte
+// length so that changing a key rewrites a known 128 KiB and never moves a byte
 // of payload.
 const (
 	SuperblockSize = 4096
@@ -29,7 +29,7 @@ const (
 	// PayloadOffset is where the first shard begins, in every container.
 	PayloadOffset = SlotTableBOffset + SlotTableSize
 
-	VersionMajor = 1
+	VersionMajor = 2
 	VersionMinor = 0
 )
 
@@ -66,8 +66,25 @@ const (
 	offKeyCommitment   = 176
 	offHeaderMAC       = 208
 	offLastShardBytes  = 240
-	offReserved        = 248
+	offPayloadSHA256   = 244
+	offSignatureScheme = 276
+	offSignerID        = 280
+	offSignature       = 312
+	offReserved        = offSignature + crypto.WriterSignatureLen // 3685
 )
+
+// SignatureScheme says whether and how a header is signed by its writer.
+type SignatureScheme uint32
+
+const (
+	SignatureNone SignatureScheme = 0
+	// SignatureEd25519MLDSA65 is Ed25519 followed by ML-DSA-65, over
+	// SignedBytes. Both have to verify.
+	SignatureEd25519MLDSA65 SignatureScheme = 1
+)
+
+// signatureLabel opens the message a writer signs.
+const signatureLabel = "BOND-WRITER-V2"
 
 // Flags describing a container without needing its key.
 const (
@@ -105,7 +122,11 @@ type Superblock struct {
 	DataShards     uint32 // stripe geometry; zero when there is no parity
 	ParityShards   uint32
 	DataShardCount uint64
-	StreamLength   uint64 // exact length of the compressed stream
+	// StreamLength is how many stream bytes the shards hold: the compressed
+	// stream padded with zeros to its Padmé length. The exact length is in the
+	// manifest, which is sealed; what a header shows without a key is only the
+	// padded one.
+	StreamLength uint64
 
 	// LastShardBytes is the on-disk size of the final shard, which is the only
 	// one allowed to be short. Padding it to a full shard would cost up to a
@@ -128,6 +149,21 @@ type Superblock struct {
 
 	KeyCommitment []byte // 32
 	HeaderMAC     []byte // 32
+
+	// PayloadSHA256 is the SHA-256 of this volume's slice of the payload as
+	// stored: sealed data shards and sealed parity, in file order. It needs no
+	// key to recompute, so together with a writer signature it lets someone
+	// holding only the writer's public key check that a volume is the one that
+	// was written – which the checksum file beside it cannot, being as easy to
+	// replace as the container.
+	PayloadSHA256 []byte // 32
+
+	// The writer's signature. SignerID is the SHA-256 of the writer's public
+	// key; it names the key and proves nothing until the signature has been
+	// checked against a key the reader was told to expect.
+	SignatureScheme SignatureScheme
+	SignerID        []byte // 32
+	Signature       []byte // crypto.WriterSignatureLen
 
 	// raw is the 4096 bytes this superblock was parsed from, kept so the MAC
 	// can be checked against what is on disk rather than against a re-rendering
@@ -165,6 +201,10 @@ func (s *Superblock) Marshal() []byte {
 	copy(b[offKeyCommitment:], s.KeyCommitment)
 	copy(b[offHeaderMAC:], s.HeaderMAC)
 	binary.LittleEndian.PutUint32(b[offLastShardBytes:], s.LastShardBytes)
+	copy(b[offPayloadSHA256:], s.PayloadSHA256)
+	binary.LittleEndian.PutUint32(b[offSignatureScheme:], uint32(s.SignatureScheme))
+	copy(b[offSignerID:], s.SignerID)
+	copy(b[offSignature:], s.Signature)
 	return b
 }
 
@@ -211,6 +251,10 @@ func Unmarshal(b []byte) (*Superblock, error) {
 		KeyCommitment:      append([]byte(nil), b[offKeyCommitment:offKeyCommitment+32]...),
 		HeaderMAC:          append([]byte(nil), b[offHeaderMAC:offHeaderMAC+32]...),
 		LastShardBytes:     binary.LittleEndian.Uint32(b[offLastShardBytes:]),
+		PayloadSHA256:      append([]byte(nil), b[offPayloadSHA256:offPayloadSHA256+32]...),
+		SignatureScheme:    SignatureScheme(binary.LittleEndian.Uint32(b[offSignatureScheme:])),
+		SignerID:           append([]byte(nil), b[offSignerID:offSignerID+crypto.WriterIDLen]...),
+		Signature:          append([]byte(nil), b[offSignature:offSignature+crypto.WriterSignatureLen]...),
 	}
 
 	if got := binary.LittleEndian.Uint32(b[offHeaderSize:]); got != SuperblockSize {
@@ -226,7 +270,77 @@ func Unmarshal(b []byte) (*Superblock, error) {
 	if err := s.checkBounds(); err != nil {
 		return nil, err
 	}
+	switch s.SignatureScheme {
+	case SignatureEd25519MLDSA65:
+	case SignatureNone:
+		// An unsigned header has nothing in the signature fields. Bytes there
+		// would be a signature of a scheme nobody declared.
+		if !allZero(b[offSignerID:offReserved]) {
+			return nil, fmt.Errorf("the header is not signed, but carries signature bytes")
+		}
+	default:
+		return nil, fmt.Errorf("unknown signature scheme %d", uint32(s.SignatureScheme))
+	}
 	return s, nil
+}
+
+func allZero(b []byte) bool {
+	for _, x := range b {
+		if x != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// SignedBytes is the message a writer signs: T("BOND-WRITER-V2", header), with
+// the header's MAC and signature fields zeroed.
+//
+// The MAC is left out because it is computed last, over the signature; the
+// signature is left out because it cannot sign itself. Everything else is in –
+// the scheme and the signer's fingerprint, the container UUID and the key
+// commitment, the volume's position in its set, its payload digest, and the
+// manifest digest, which through the manifest covers the stream digest and the
+// file index.
+func (s *Superblock) SignedBytes() []byte {
+	b := s.Marshal()
+	if s.raw != nil {
+		b = append([]byte(nil), s.raw...)
+	}
+	clear(b[offHeaderMAC : offHeaderMAC+32])
+	clear(b[offSignature:offReserved])
+	return crypto.Tuple([]byte(signatureLabel), b)
+}
+
+// SignWriter signs the header with a writer key. It has to run before Sign,
+// which computes the MAC over the signature.
+func (s *Superblock) SignWriter(w crypto.Signer) error {
+	s.raw = nil
+	s.SignatureScheme = SignatureEd25519MLDSA65
+	s.SignerID = append([]byte(nil), w.Fingerprint()...)
+	s.Signature = nil
+	sig, err := w.Sign(s.SignedBytes())
+	if err != nil {
+		return fmt.Errorf("signing the header: %w", err)
+	}
+	s.Signature = sig
+	return nil
+}
+
+// ErrNotSigned means a header carries no writer signature.
+var ErrNotSigned = fmt.Errorf("the container is not signed by any writer")
+
+// VerifyWriter checks the header's signature against the key a reader was told
+// to expect. It needs no decryption key: the signature is over the header's
+// bytes, and the header is readable by anyone.
+func (s *Superblock) VerifyWriter(pub *crypto.WriterPublic) error {
+	if s.SignatureScheme == SignatureNone {
+		return ErrNotSigned
+	}
+	if !bytes.Equal(s.SignerID, pub.Fingerprint()) {
+		return fmt.Errorf("the container is signed by writer %x, not by the expected %x", s.SignerID[:8], pub.Fingerprint()[:8])
+	}
+	return pub.Verify(s.SignedBytes(), s.Signature)
 }
 
 // checkBounds rejects a header whose numbers cannot describe a real container.

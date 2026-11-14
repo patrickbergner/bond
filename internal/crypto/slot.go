@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"golang.org/x/crypto/argon2"
+	"golang.org/x/text/unicode/norm"
 )
 
 // SlotType is how one key slot is unlocked.
@@ -42,6 +43,16 @@ func (s SlotType) String() string {
 // ErrWrongKey means a slot exists but the secret offered does not open it.
 var ErrWrongKey = errors.New("wrong passphrase or key")
 
+// ErrSlotDamaged means the secret is the right one for a slot – its key
+// commitment matches – and the wrapped master key inside still does not open.
+// That is damage or tampering, not a mistyped passphrase, and it is worth
+// telling apart: the answer to one is "try again" and to the other "use the
+// spare table, or another key".
+var ErrSlotDamaged = errors.New("the key matches this slot, but the master key stored in it is damaged")
+
+// CommitmentLen is the size of a slot's key commitment.
+const CommitmentLen = 32
+
 // KDFParams are Argon2id's cost settings, stored per slot so they can be
 // raised for new containers without invalidating old ones.
 type KDFParams struct {
@@ -50,13 +61,15 @@ type KDFParams struct {
 	Parallelism uint32 `json:"parallelism"`
 }
 
-// DefaultKDF is the starting point: roughly a second on a current desktop, and
-// 512 MiB of memory that an attacker has to find for every single guess.
-// "bond bench-kdf" measures the machine and suggests something better.
+// DefaultKDF is what every passphrase slot is written with: well under a second
+// on a current desktop, and 512 MiB of memory that an attacker has to find for
+// every single guess. "bond bench-kdf" measures what it costs on a machine;
+// there is no setting that selects another profile.
 var DefaultKDF = KDFParams{MemoryKiB: 512 * 1024, Iterations: 3, Parallelism: 4}
 
 // LowMemoryKDF is RFC 9106's second recommended profile, for machines that
-// cannot spare half a gigabyte. It is weaker, and BOND only uses it when asked.
+// cannot spare half a gigabyte. It is weaker. Nothing writes a slot with it;
+// bench-kdf times it for comparison.
 var LowMemoryKDF = KDFParams{MemoryKiB: 64 * 1024, Iterations: 3, Parallelism: 4}
 
 // ErrKDFPolicy means a valid Argon2 profile exceeds the amount of
@@ -173,12 +186,68 @@ type Slot struct {
 	Nonce   []byte // 24 bytes
 	Wrapped []byte // the sealed master key, 48 bytes
 
+	// Commitment binds the slot to the one key-encryption key that made it.
+	//
+	// An AEAD tag does not do that: XChaCha20-Poly1305 does not commit to its
+	// key, so a wrapped key can be built that opens under several
+	// key-encryption keys at once. With that, whoever stores a container can
+	// swap in a slot that opens under a whole set of candidate passphrases
+	// and learn from how the reader fails which set the real one is in – many
+	// guesses for the price of one unlock. The commitment is checked before
+	// anything is decrypted, and a secret that does not match it is a wrong
+	// key and nothing more.
+	Commitment []byte // 32 bytes
+
 	Salt []byte    // 16 bytes; passphrase and keyfile slots
 	KDF  KDFParams // passphrase slots only
 
 	// Encapsulation carries a recipient slot's ephemeral public key and
 	// ML-KEM ciphertext. Empty for every other slot type.
 	Encapsulation []byte
+}
+
+// DisplayLabel is the label made safe to print.
+//
+// A label is read from the slot table before anything has authenticated it, and
+// it is free text: whoever stores the container can put terminal control
+// sequences into it, and "bond keys list" would send them to the operator's
+// terminal. Everything that prints a label prints this.
+func (s *Slot) DisplayLabel() string { return Printable(s.Label) }
+
+// Printable replaces what a terminal would act on rather than show: control
+// characters, the C1 range, bidirectional overrides, and bytes that are not
+// valid UTF-8.
+func Printable(text string) string {
+	clean := true
+	for _, r := range text {
+		if unprintable(r) {
+			clean = false
+			break
+		}
+	}
+	if clean {
+		return text
+	}
+	out := make([]rune, 0, len(text))
+	for _, r := range text {
+		if unprintable(r) {
+			r = '?'
+		}
+		out = append(out, r)
+	}
+	return string(out)
+}
+
+func unprintable(r rune) bool {
+	switch {
+	case r < 0x20, r >= 0x7f && r <= 0x9f:
+		return true
+	case r == 0xFFFD: // also what a byte that is not UTF-8 decodes to
+		return true
+	case r >= 0x202A && r <= 0x202E, r >= 0x2066 && r <= 0x2069:
+		return true
+	}
+	return false
 }
 
 // Unlocker is a secret offered to a slot.
@@ -204,9 +273,21 @@ func (p Passphrase) kek(s *Slot) ([]byte, error) {
 	if err := s.KDF.Validate(); err != nil {
 		return nil, fmt.Errorf("this container's key slot is unusable: %w", err)
 	}
+	// The passphrase is hashed in Unicode normalization form C. The same
+	// characters reach a program as different bytes depending on the keyboard
+	// and the operating system – an umlaut typed on macOS may arrive as a
+	// letter followed by a combining mark, on Windows as one code point – and a
+	// backup written on one and restored on the other would otherwise be
+	// refused its own passphrase. Bytes that are not text pass through as they
+	// are.
+	// Append into a buffer of its own: Bytes hands back its argument when
+	// nothing needed changing, and wiping that would wipe the caller's
+	// passphrase.
+	normalized := norm.NFC.Append(make([]byte, 0, len(p)), p...)
+	defer Wipe(normalized)
 	// Validate has already refused a lane count that does not fit in the byte
 	// Argon2 takes, so this narrowing cannot lose anything.
-	return argon2.IDKey(p, s.Salt, s.KDF.Iterations, s.KDF.MemoryKiB, uint8(s.KDF.Parallelism), KeyLen), nil
+	return argon2.IDKey(normalized, s.Salt, s.KDF.Iterations, s.KDF.MemoryKiB, uint8(s.KDF.Parallelism), KeyLen), nil
 }
 
 // KeyfileSecret unlocks key-file slots. The key file is 32 random bytes; the
@@ -267,12 +348,90 @@ func NewSlot(c Cipher, containerUUID []byte, fmk FMK, secret Unlocker, kdf KDFPa
 	}
 	defer Wipe(kek)
 
-	aead, err := AEAD(c, kek)
+	if err := s.seal(c, containerUUID, kek, fmk); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// Reseal wraps fmk again in a slot whose identifiers, salt and nonce are
+// already set, instead of drawing fresh ones.
+//
+// It exists for known-answer vectors, which need a slot whose every random
+// input is fixed so that the wrapped key and its commitment can be compared
+// byte for byte. Nothing that writes a container uses it: a nonce chosen by
+// the caller is a nonce that can be chosen twice.
+func (s *Slot) Reseal(c Cipher, containerUUID []byte, fmk FMK, secret Unlocker) error {
+	if secret.slotType() != s.Type || s.Type == SlotRecipient {
+		return fmt.Errorf("a %s slot cannot be resealed with this secret", s.Type)
+	}
+	kek, err := secret.kek(s)
+	if err != nil {
+		return err
+	}
+	defer Wipe(kek)
+	return s.seal(c, containerUUID, kek, fmk)
+}
+
+// slotKeys splits a key-encryption key into the key that wraps the master key
+// and the key that commits to it, so neither job borrows the other's key.
+func slotKeys(kek []byte) (enc, com []byte, err error) {
+	if enc, err = deriveHKDF(kek, nil, infoSlotEnc); err != nil {
+		return nil, nil, err
+	}
+	if com, err = deriveHKDF(kek, nil, infoSlotCom); err != nil {
+		Wipe(enc)
+		return nil, nil, err
+	}
+	return enc, com, nil
+}
+
+// seal wraps the master key under kek and records the commitment to kek.
+func (s *Slot) seal(c Cipher, containerUUID, kek []byte, fmk FMK) error {
+	enc, com, err := slotKeys(kek)
+	if err != nil {
+		return err
+	}
+	defer Wipe(enc)
+	defer Wipe(com)
+
+	aead, err := AEAD(c, enc)
+	if err != nil {
+		return err
+	}
+	aad := s.aad(containerUUID)
+	s.Commitment = MAC(com, Tuple(s.Nonce, aad))
+	s.Wrapped = aead.Seal(nil, s.Nonce, fmk, aad)
+	return nil
+}
+
+// open is the reverse of seal. The commitment is checked first and in constant
+// time: a key that does not match it is ErrWrongKey before any decryption.
+func (s *Slot) open(c Cipher, containerUUID, kek []byte) (FMK, error) {
+	enc, com, err := slotKeys(kek)
 	if err != nil {
 		return nil, err
 	}
-	s.Wrapped = aead.Seal(nil, s.Nonce, fmk, s.aad(containerUUID))
-	return s, nil
+	defer Wipe(enc)
+	defer Wipe(com)
+
+	aad := s.aad(containerUUID)
+	if !CheckMAC(com, Tuple(s.Nonce, aad), s.Commitment) {
+		return nil, ErrWrongKey
+	}
+	aead, err := AEAD(c, enc)
+	if err != nil {
+		return nil, err
+	}
+	fmk, err := aead.Open(nil, s.Nonce, s.Wrapped, aad)
+	if err != nil {
+		return nil, ErrSlotDamaged
+	}
+	if len(fmk) != KeyLen {
+		Wipe(fmk)
+		return nil, fmt.Errorf("this slot holds a %d-byte key, want %d", len(fmk), KeyLen)
+	}
+	return fmk, nil
 }
 
 // Unwrap recovers the master key from this slot, or reports ErrWrongKey.
@@ -290,34 +449,22 @@ func (s *Slot) Unwrap(c Cipher, containerUUID []byte, secret Unlocker) (FMK, err
 		return nil, err
 	}
 	defer Wipe(kek)
-
-	aead, err := AEAD(c, kek)
-	if err != nil {
-		return nil, err
-	}
-	fmk, err := aead.Open(nil, s.Nonce, s.Wrapped, s.aad(containerUUID))
-	if err != nil {
-		return nil, ErrWrongKey
-	}
-	if len(fmk) != KeyLen {
-		return nil, fmt.Errorf("this slot holds a %d-byte key, want %d", len(fmk), KeyLen)
-	}
-	return fmk, nil
+	return s.open(c, containerUUID, kek)
 }
 
 // aad binds the wrapped key to its container, its slot and its parameters, so
 // a slot cannot be copied between containers and the cost parameters cannot be
 // lowered by an attacker hoping to make guessing cheaper.
 func (s *Slot) aad(containerUUID []byte) []byte {
-	params := s.Salt
+	var params []byte
 	switch s.Type {
 	case SlotPassphrase:
-		params = append(append([]byte{}, s.Salt...), s.KDF.encode()...)
+		params = s.KDF.encode()
 	case SlotRecipient:
 		// The key exchange is part of what this slot is, so it is bound in too.
-		params = append(append([]byte{}, s.Salt...), s.Encapsulation...)
+		params = s.Encapsulation
 	}
-	return SlotAAD(containerUUID, s.UUID, uint8(s.Type), params)
+	return SlotAAD(containerUUID, s.UUID, uint8(s.Type), s.Salt, params)
 }
 
 func hkdfKey(secret, salt []byte, info string) ([]byte, error) {

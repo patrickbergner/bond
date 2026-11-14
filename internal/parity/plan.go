@@ -44,6 +44,12 @@ func (p Plan) String() string {
 
 // For chooses a geometry for a recovery percentage.
 //
+// The mapping is part of format 1.0 (NERDME §6): the manifest records the
+// percentage, the header records k and p, and a reader refuses a container in
+// which For of the one is not the other. Changing what this returns for any
+// input makes every existing container with that percentage unreadable, so it
+// is a new format version and not a tuning change.
+//
 // Two parity shards is the floor for anything meaningful – one gives no margin
 // once a shard is already lost – so the percentage is met by choosing how many
 // data shards they cover. A stripe of fewer than eight data shards is a poor

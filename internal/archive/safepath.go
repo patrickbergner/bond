@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"unicode/utf8"
 )
 
 // A restore reads names that were written somewhere else, possibly years ago,
@@ -19,7 +20,9 @@ import (
 // windowsReserved are device names MS-DOS still reserves. Creating one on
 // Windows opens a device rather than a file.
 var windowsReserved = map[string]bool{
-	"con": true, "prn": true, "aux": true, "nul": true,
+	"con": true, "prn": true, "aux": true, "nul": true, "conin$": true, "conout$": true,
+	"com0": true, "com¹": true, "com²": true, "com³": true,
+	"lpt0": true, "lpt¹": true, "lpt²": true, "lpt³": true,
 	"com1": true, "com2": true, "com3": true, "com4": true, "com5": true,
 	"com6": true, "com7": true, "com8": true, "com9": true,
 	"lpt1": true, "lpt2": true, "lpt3": true, "lpt4": true, "lpt5": true,
@@ -90,19 +93,31 @@ func checkName(name string, windows bool) error {
 		if strings.HasSuffix(part, " ") || strings.HasSuffix(part, ".") {
 			return fmt.Errorf("component %q ends in a space or dot, which Windows silently strips", part)
 		}
+		// Windows takes a device name whatever follows its first dot, and
+		// ignores spaces before that dot: "NUL .txt" opens the device just as
+		// "NUL.txt" does.
 		stem, _, _ := strings.Cut(part, ".")
-		if windowsReserved[strings.ToLower(stem)] {
+		if windowsReserved[strings.ToLower(strings.TrimRight(stem, " "))] {
 			return fmt.Errorf("component %q is a reserved device name on Windows", part)
 		}
 	}
 	return nil
 }
 
+// namesAreBytes is where a file name may be any byte string.
+const namesAreBytes = runtime.GOOS == "linux"
+
 // SafeJoin turns an archive name into a path under dest, or explains why it
 // cannot. dest must already be absolute and cleaned.
 func SafeJoin(dest, name string) (string, error) {
 	if err := CheckName(name); err != nil {
 		return "", err
+	}
+	// A name that is not UTF-8 exists as written only where names are bytes.
+	// Windows would store something else under it and macOS refuses it, so it
+	// is refused here by name rather than restored as a different file.
+	if !namesAreBytes && !utf8.ValidString(name) {
+		return "", fmt.Errorf("the name is not valid UTF-8, which this system cannot store; restore it on Linux, or leave it out with --include")
 	}
 	full := filepath.Join(dest, filepath.FromSlash(strings.TrimSuffix(name, "/")))
 

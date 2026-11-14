@@ -3,11 +3,14 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 )
 
 // Version is stamped by build.sh; the default marks an ad-hoc build.
@@ -43,8 +46,28 @@ func commands() []command {
 	}
 }
 
+// rootCtx is cancelled by Ctrl-C and by SIGTERM.
+//
+// Every command that writes runs under it, so an interrupted run comes back
+// through the same error paths as any other failure: the half-written
+// container is removed from the working directory, the unpacked 7-Zip helper
+// is deleted, and nothing is published. Without it the process simply died,
+// and because container names carry a timestamp every interrupted backup left
+// a partial of up to full size behind that no later run would ever touch.
+var rootCtx = context.Background()
+
 func main() {
-	os.Exit(run(os.Args[1:]))
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	rootCtx = ctx
+	go func() {
+		// After the first signal the default behaviour comes back, so a second
+		// one ends a process that is not winding down.
+		<-ctx.Done()
+		stop()
+	}()
+	code := run(os.Args[1:])
+	stop()
+	os.Exit(code)
 }
 
 func run(args []string) int {
@@ -83,6 +106,10 @@ func dispatch(fn func([]string) error, args []string) int {
 		fmt.Fprintf(os.Stderr, "bond: %v\n", err)
 		return exitUsage
 	default:
+		if rootCtx.Err() != nil {
+			fmt.Fprintf(os.Stderr, "bond: interrupted; nothing was published and the working files were removed (%v)\n", err)
+			return exitFailure
+		}
 		fmt.Fprintf(os.Stderr, "bond: %v\n", err)
 		return exitFailure
 	}

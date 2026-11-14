@@ -3,9 +3,28 @@ package ui
 
 import (
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
+	"sync"
+
+	"golang.org/x/term"
+
+	"github.com/patrickbergner/bond/internal/crypto"
 )
+
+// Path renders a file name for the terminal. Names in a backup are whatever was
+// on the disk it came from, control characters included; on a terminal those
+// are replaced, and in a pipe the name is passed through exactly, because a
+// script reading "bond list" needs the real one.
+func Path(name string) string {
+	if !stdoutIsTerminal() {
+		return name
+	}
+	return crypto.Printable(name)
+}
+
+var stdoutIsTerminal = sync.OnceValue(func() bool { return term.IsTerminal(int(os.Stdout.Fd())) })
 
 // Bytes renders a size the way a person reads it: exact below a kibibyte,
 // three significant digits above.

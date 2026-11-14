@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"crypto/rand"
 	"fmt"
 	"os"
@@ -41,7 +40,7 @@ options:
 		return err
 	}
 
-	ctx := context.Background()
+	ctx := rootCtx
 	fmt.Printf("bond %s  %s/%s\n\n", Version, runtime.GOOS, runtime.GOARCH)
 
 	tool, err := sevenzip.Extract("")

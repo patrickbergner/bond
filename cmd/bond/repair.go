@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/patrickbergner/bond/internal/backup"
-	"github.com/patrickbergner/bond/internal/config"
 	"github.com/patrickbergner/bond/internal/container"
 	"github.com/patrickbergner/bond/internal/ui"
 )
@@ -46,8 +45,9 @@ options:
 	if out == "" {
 		out = repairedName(path)
 	}
-	// A split set is written as out.001, out.002, …, so the plain name existing
-	// is not the only way the destination can be occupied.
+	// Refused before anything is unlocked or read. The repair checks the whole
+	// namespace again – every volume number and every checksum file – when it
+	// publishes, and replaces nothing.
 	for _, taken := range []string{out, out + container.VolumeSuffix(0)} {
 		if _, err := os.Stat(taken); err == nil {
 			return fmt.Errorf("%s already exists; name a different destination with --out", taken)
@@ -102,7 +102,10 @@ options:
 
 	started := time.Now()
 	stripes := ui.NewProgress(os.Stderr)
-	result, err := container.Repair(r, out, report, func(s, total int) { stripes.Add(int64(sb.ShardSize)) })
+	// The repaired copy is assembled under a staging name, verified in full –
+	// every copy of the metadata and every shard – and only then given its name,
+	// so by the time this returns the check is done and not optional.
+	result, err := container.Repair(rootCtx, r, out, report, func(s, total int) { stripes.Add(int64(sb.ShardSize)) })
 	stripes.Clear()
 	if err != nil {
 		return err
@@ -114,36 +117,13 @@ options:
 		fmt.Printf("  rewritten     %s\n", region)
 	}
 
-	// A repaired container is worth nothing until it has been checked as a
-	// whole, so the check is not optional.
-	fixed, err := container.Open(out)
-	if err != nil {
-		return fmt.Errorf("the repaired container cannot be opened: %w", err)
-	}
-	defer fixed.Close()
-	secrets, err := keys.unlockersFor(fixed.Slots())
-	if err != nil {
-		return err
-	}
-	defer wipeUnlockers(secrets)
-	if err := fixed.UnlockWithOptions(keys.unlockOptions(), secrets...); err != nil {
-		return fmt.Errorf("the repaired container does not unlock: %w", err)
-	}
-	after, err := fixed.Verify(nil)
-	if err != nil {
-		return err
-	}
-	if !after.Healthy() {
-		return fmt.Errorf("the repaired container is still damaged; the recovery data was not enough")
-	}
-
 	fmt.Printf("  written       %s\n", out)
 	fmt.Printf("  verified      every shard authenticates and the stream matches its digest\n")
 
 	// The checksum file belonged to the damaged bytes; the repaired copy needs
 	// its own or the next --quick check will report a mismatch. One per volume,
 	// as a backup writes them: they are uploaded and checked a file at a time.
-	if algorithm := sidecarAlgorithm(r.Paths()[0]); algorithm != "" {
+	if algorithm := backup.SidecarAlgorithm(r.Paths()[0]); algorithm != "" {
 		for _, p := range result.Paths {
 			sidecar, err := backup.WriteSidecar(p, algorithm)
 			if err != nil {
@@ -162,24 +142,9 @@ options:
 // set in its own right and numbers its own volumes, so keeping the suffix would
 // produce backup.bond.repaired.001.001.
 func repairedName(path string) string {
-	base := container.VolumeBase(path)
+	base := container.SetBase(path)
 	ext := filepath.Ext(base)
 	return strings.TrimSuffix(base, ext) + ".repaired" + ext
-}
-
-// sidecarAlgorithm reports which checksum file, if any, sits next to a
-// container.
-func sidecarAlgorithm(path string) string {
-	for _, c := range []struct{ ext, alg string }{
-		{".sha256", config.HashSHA256},
-		{".sha384", config.HashSHA384},
-		{".sha512", config.HashSHA512},
-	} {
-		if _, err := os.Stat(path + c.ext); err == nil {
-			return c.alg
-		}
-	}
-	return ""
 }
 
 func summariseInts(v []int) string {

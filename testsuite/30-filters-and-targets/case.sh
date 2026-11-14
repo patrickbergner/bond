@@ -37,7 +37,7 @@ config_write "$cfg"
 # not the case.
 restore_of() {
     RESTORED="$CASE_TMP/restored-$1"
-    bond_ok restore "$(container_for "$out" "$1")" --to "$RESTORED"
+    bond_ok restore --allow-unencrypted "$(container_for "$out" "$1")" --to "$RESTORED"
 }
 
 step "a dry run reports what would be stored and writes nothing at all"
@@ -118,7 +118,7 @@ config_target_multi pair "            { \"path\": $(json_string "$CASE_TMP/trees
             { \"path\": $(json_string "$CASE_TMP/trees/beta") }"
 config_write "$cfg"
 bond_ok backup --config "$cfg" --target pair
-bond_ok restore "$(container_for "$two" pair)" --to "$CASE_TMP/restored-pair"
+bond_ok restore --allow-unencrypted "$(container_for "$two" pair)" --to "$CASE_TMP/restored-pair"
 assert_paths "$CASE_TMP/restored-pair" 'alpha/a.txt
 beta/b.txt'
 
@@ -130,5 +130,5 @@ config_setting '"compressionLevel": 0'
 config_target lonely "$src/notes.txt"
 config_write "$cfg"
 bond_ok backup --config "$cfg" --target lonely
-bond_ok restore "$(container_for "$one" lonely)" --to "$CASE_TMP/restored-one"
+bond_ok restore --allow-unencrypted "$(container_for "$one" lonely)" --to "$CASE_TMP/restored-one"
 assert_paths "$CASE_TMP/restored-one" 'notes.txt'

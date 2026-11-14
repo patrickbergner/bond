@@ -1,24 +1,24 @@
 {
   "tools": {
     "7-zip": {
-      "version": "26.02",
+      "version": "26.06",
       "binDir": "internal/sevenzip/bin",
       "packages": {
         "extra": {
-          "url": "https://www.7-zip.org/a/7z2602-extra.7z",
-          "sha256": "081df9e9311dfd9c9e0e98c1c80180b99bb51e4cb24156b5f3057fe3c259d70a"
+          "url": "https://github.com/ip7z/7zip/releases/download/26.06/7z2606-extra.7z",
+          "sha256": "396c180f12d2247c24b0b1fcd482c6fc2a2700f61211ffede1061dd971f5e104"
         },
         "linux-arm64": {
-          "url": "https://www.7-zip.org/a/7z2602-linux-arm64.tar.xz",
-          "sha256": "70ea6cc737ae1495ea2d7eb20ef3120fe579bd3f1a83a9d2362b62ec5bde2bba"
+          "url": "https://github.com/ip7z/7zip/releases/download/26.06/7z2606-linux-arm64.tar.xz",
+          "sha256": "edcc408aacce77da5223728f2eceb5e9f6dc713b8a9df934ad21e2a7f7560627"
         },
         "linux-x64": {
-          "url": "https://www.7-zip.org/a/7z2602-linux-x64.tar.xz",
-          "sha256": "41aaba7b1235304ab5aa0624530c67ae829496cd29e875925271efdccc28c03e"
+          "url": "https://github.com/ip7z/7zip/releases/download/26.06/7z2606-linux-x64.tar.xz",
+          "sha256": "2b539cf067b2ad48e1baa5093dbaa8818b73542d1222a0ffde9dc5f2922ea62e"
         },
         "mac": {
-          "url": "https://www.7-zip.org/a/7z2602-mac.tar.xz",
-          "sha256": "1cf6760579502f87e591ff5c73a005ec50b3e4d6f507e8b038382d563c3175b9"
+          "url": "https://github.com/ip7z/7zip/releases/download/26.06/7z2606-mac.tar.xz",
+          "sha256": "b6f17920b4240940461dac8ef4009891881ac44d2a5ead625ede2ec8472185dd"
         }
       },
       "binaries": [
@@ -27,7 +27,7 @@
           "file": "7za-windows-amd64.exe",
           "package": "extra",
           "member": "x64/7za.exe",
-          "sha256": "35d4d69d7cd6cb44558f208c3b1334268013f9daf82d2dda848893a1c30c59c2",
+          "sha256": "dd3757f31c97e33776f2590317d4fb12f2da075db3dbb1e3f94d0f2a01d84ffa",
           "license": "License.txt",
           "licenseSha256": "39d2187b942cc88818dd959e53c6b7dddd152097a42061467c4d56050168d646"
         },
@@ -36,7 +36,7 @@
           "file": "7za-windows-arm64.exe",
           "package": "extra",
           "member": "arm64/7za.exe",
-          "sha256": "cadbd34657713935222eb14fddbcdd51953501b44c749d9a029fab8f1c46be7e",
+          "sha256": "4c7ead0105afb7abb564b30753b483e8e9f4652b0ecdec8081e073f098552552",
           "license": "License.txt",
           "licenseSha256": "39d2187b942cc88818dd959e53c6b7dddd152097a42061467c4d56050168d646"
         },
@@ -45,7 +45,7 @@
           "file": "7zz-linux-amd64",
           "package": "linux-x64",
           "member": "7zzs",
-          "sha256": "20df89e993594c1bb7686f125dabe1acc56c109fb1d9b40435ea5fcbc1ca3453",
+          "sha256": "0b58a64e71ebdf53751cd954cad1cc552c6a11ef51336bee6acafbdc54c28c1f",
           "license": "License.txt",
           "licenseSha256": "1790374e5352329cedb46ee3808930a88e9ca2f08b82b10fcf5cf605d2c301b1"
         },
@@ -54,7 +54,7 @@
           "file": "7zz-linux-arm64",
           "package": "linux-arm64",
           "member": "7zzs",
-          "sha256": "2f9b4ffcdc83eedb737a95bbdb04ab7f4805f8ad92aaef32ccc6b2bf32883209",
+          "sha256": "265e45b5847392c0cd97a84acb6b3f9933c3e43d698fb5a2979f5e9a80c05758",
           "license": "License.txt",
           "licenseSha256": "1790374e5352329cedb46ee3808930a88e9ca2f08b82b10fcf5cf605d2c301b1"
         },
@@ -64,7 +64,7 @@
           "package": "mac",
           "member": "7zz",
           "machoSlice": "arm64",
-          "sha256": "e90bd9610567498bf419b82c4e589005d911225e940795f9c329397b2fb26465",
+          "sha256": "56cf8eb2fdc6f9c0ac5d7a3cd238505814ac8ed6b88a7c64a7e3256036252c60",
           "license": "License.txt",
           "licenseSha256": "1790374e5352329cedb46ee3808930a88e9ca2f08b82b10fcf5cf605d2c301b1"
         }

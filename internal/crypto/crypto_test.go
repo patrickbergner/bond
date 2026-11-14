@@ -3,6 +3,7 @@ package crypto
 import (
 	"bytes"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -370,5 +371,71 @@ func TestKDFPolicyBoundsUnauthenticatedWork(t *testing.T) {
 		if err := params.Check(unlimited); err != nil {
 			t.Errorf("explicit override rejected format-valid %+v: %v", params, err)
 		}
+	}
+}
+
+// A label is unauthenticated free text that ends up on a terminal.
+func TestPrintableDefusesWhatATerminalWouldActOn(t *testing.T) {
+	for in, want := range map[string]string{
+		"offline copy":        "offline copy",
+		"Grüße – 日本":          "Grüße – 日本",
+		"\x1b[2J\x1b[Hpwned":  "?[2J?[Hpwned",
+		"line\nbreak\ttab":    "line?break?tab",
+		"c1 \u009b31m":        "c1 ?31m",
+		"rtl ‮gnp.exe":        "rtl ?gnp.exe",
+		"not utf-8 \xff\xfe.": "not utf-8 ??.",
+		"":                    "",
+	} {
+		if got := Printable(in); got != want {
+			t.Errorf("Printable(%q) = %q, want %q", in, got, want)
+		}
+	}
+	if got := (&Slot{Label: "a\x07b"}).DisplayLabel(); got != "a?b" {
+		t.Errorf("DisplayLabel = %q", got)
+	}
+}
+
+// Forgiving about how a recovery key was typed, strict about what it is.
+func TestRecoveryKeyDecodingIsStrict(t *testing.T) {
+	seed := make([]byte, SeedLen)
+	for i := range seed {
+		seed[i] = byte(i * 7)
+	}
+	key, err := EncodeRecoveryKey(seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := strings.TrimPrefix(key, CardPrefix+"-")
+
+	for name, typed := range map[string]string{
+		"as printed":         key,
+		"lower case":         strings.ToLower(key),
+		"no hyphens":         strings.ReplaceAll(key, "-", ""),
+		"body only":          body,
+		"zero in the prefix": "B0ND-R1-" + body,
+		"spaces":             strings.ReplaceAll(key, "-", " "),
+	} {
+		got, err := DecodeRecoveryKey(typed)
+		if err != nil || !bytes.Equal(got, seed) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	for name, typed := range map[string]string{
+		"trailing characters": key + "ZZZZ",
+		"one character more":  key + "0",
+		"one character less":  key[:len(key)-1],
+		"doubled":             key + body,
+		"another version":     "BOND-R2-" + body,
+		"empty":               "",
+	} {
+		if _, err := DecodeRecoveryKey(typed); err == nil {
+			t.Errorf("%s was accepted", name)
+		}
+	}
+	// The last character carries three unused bits; a key that sets one is not
+	// the key that was printed.
+	last := strings.IndexByte(cardAlphabet, key[len(key)-1])
+	if _, err := DecodeRecoveryKey(key[:len(key)-1] + string(cardAlphabet[last^1])); err == nil {
+		t.Error("a key with a non-zero spare bit was accepted")
 	}
 }

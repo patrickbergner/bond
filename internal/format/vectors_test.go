@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"reflect"
 	"testing"
@@ -14,40 +15,66 @@ import (
 	"github.com/patrickbergner/bond/internal/parity"
 )
 
-type v1Vectors struct {
-	FMK                 string   `json:"fmk"`
-	ContainerUUID       string   `json:"containerUuid"`
-	DataKey             string   `json:"dataKey"`
-	HeaderKey           string   `json:"headerKey"`
-	ManifestKey         string   `json:"manifestKey"`
-	CommitKey           string   `json:"commitKey"`
-	Commitment          string   `json:"commitment"`
-	ShardNonce          string   `json:"shardNonce"`
-	ShardAAD            string   `json:"shardAad"`
-	SlotAAD             string   `json:"slotAad"`
-	ManifestAAD         string   `json:"manifestAad"`
-	HeaderMAC           string   `json:"headerMac"`
-	HeaderSHA256        string   `json:"headerSha256"`
-	SlotTableMAC        string   `json:"slotTableMac"`
-	SlotTableSHA256     string   `json:"slotTableSha256"`
-	RecipientSeed       string   `json:"recipientSeed"`
-	RecipientPublic     string   `json:"recipientPublic"`
-	RecipientPublicHash string   `json:"recipientPublicSha256"`
-	RecoveryKey         string   `json:"recoveryKey"`
-	ManifestFrame       string   `json:"manifestFrame"`
-	ManifestFrameHash   string   `json:"manifestFrameSha256"`
-	Parity              []string `json:"parity"`
+type v2Vectors struct {
+	Tuple               string            `json:"tuple"`
+	Padme               map[string]uint64 `json:"padme"`
+	FMK                 string            `json:"fmk"`
+	ContainerUUID       string            `json:"containerUuid"`
+	DataKey             string            `json:"dataKey"`
+	HeaderKey           string            `json:"headerKey"`
+	ManifestKey         string            `json:"manifestKey"`
+	CommitKey           string            `json:"commitKey"`
+	Commitment          string            `json:"commitment"`
+	ShardNonce          string            `json:"shardNonce"`
+	ShardAAD            string            `json:"shardAad"`
+	ShardSealed         string            `json:"shardSealed"`
+	SlotAAD             string            `json:"slotAad"`
+	ManifestAAD         string            `json:"manifestAad"`
+	PassphraseKEK       string            `json:"passphraseKek"`
+	KeyfileSlotCommit   string            `json:"keyfileSlotCommitment"`
+	KeyfileSlotWrapped  string            `json:"keyfileSlotWrapped"`
+	HeaderMAC           string            `json:"headerMac"`
+	HeaderSHA256        string            `json:"headerSha256"`
+	SlotTableMAC        string            `json:"slotTableMac"`
+	SlotTableSHA256     string            `json:"slotTableSha256"`
+	RecipientSeed       string            `json:"recipientSeed"`
+	RecipientPublic     string            `json:"recipientPublic"`
+	RecipientPublicHash string            `json:"recipientPublicSha256"`
+	RecoveryKey         string            `json:"recoveryKey"`
+	ManifestFrame       string            `json:"manifestFrame"`
+	ManifestFrameHash   string            `json:"manifestFrameSha256"`
+	Parity              []string          `json:"parity"`
+	WriterSeed          string            `json:"writerSeed"`
+	WriterPublicHash    string            `json:"writerPublicSha256"`
+	WriterFingerprint   string            `json:"writerFingerprint"`
+	SignedHeaderSHA256  string            `json:"signedHeaderSha256"`
+	SignatureSHA256     string            `json:"writerSignatureSha256"`
 }
 
-func TestFormatV1KnownAnswerVectors(t *testing.T) {
-	raw, err := os.ReadFile("testdata/v1-vectors.json")
+func TestFormatV2KnownAnswerVectors(t *testing.T) {
+	raw, err := os.ReadFile("testdata/v2-vectors.json")
 	if err != nil {
 		t.Fatal(err)
 	}
-	var v v1Vectors
+	var v v2Vectors
 	if err := json.Unmarshal(raw, &v); err != nil {
 		t.Fatal(err)
 	}
+
+	checkHex(t, "tuple", crypto.Tuple([]byte("abc"), nil, []byte{0xff, 0x00}), v.Tuple)
+	if len(v.Padme) == 0 {
+		t.Fatal("no Padmé vectors")
+	}
+	for input, want := range v.Padme {
+		var n uint64
+		if _, err := fmt.Sscan(input, &n); err != nil {
+			t.Fatal(err)
+		}
+		if got := format.Padme(n); got != want {
+			t.Errorf("Padme(%d) = %d, want %d", n, got, want)
+		}
+	}
+
 	fmk, uuid := decode(t, v.FMK), decode(t, v.ContainerUUID)
 	keys, err := crypto.Derive(fmk, uuid)
 	if err != nil {
@@ -62,11 +89,51 @@ func TestFormatV1KnownAnswerVectors(t *testing.T) {
 
 	noncePrefix := sequence(0x40, 16)
 	slotUUID := sequence(0x50, 16)
+	salt := sequence(0xd0, 16)
 	params := []byte{0, 0, 1, 0, 3, 0, 0, 0, 4, 0, 0, 0}
-	checkHex(t, "shard nonce", crypto.ShardNonce(noncePrefix, 0x0102030405060708), v.ShardNonce)
-	checkHex(t, "shard AAD", crypto.ShardAAD(uuid, 0x0102030405060708, 4096), v.ShardAAD)
-	checkHex(t, "slot AAD", crypto.SlotAAD(uuid, slotUUID, uint8(crypto.SlotPassphrase), params), v.SlotAAD)
+	const shardIndex = 0x0102030405060708
+	checkHex(t, "shard nonce", crypto.ShardNonce(noncePrefix, shardIndex), v.ShardNonce)
+	checkHex(t, "shard AAD", crypto.ShardAAD(uuid, shardIndex, 4096), v.ShardAAD)
+	checkHex(t, "slot AAD", crypto.SlotAAD(uuid, slotUUID, uint8(crypto.SlotPassphrase), salt, params), v.SlotAAD)
 	checkHex(t, "manifest AAD", crypto.ManifestAAD(uuid), v.ManifestAAD)
+
+	// Encryption, not only decryption: every input of this shard is fixed.
+	dataAEAD, err := crypto.AEAD(crypto.CipherXChaCha20Poly1305, keys.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkHex(t, "sealed shard", dataAEAD.Seal(nil, crypto.ShardNonce(noncePrefix, shardIndex), sequence(0x70, 48),
+		crypto.ShardAAD(uuid, shardIndex, 4096)), v.ShardSealed)
+
+	// The passphrase is hashed in NFC, whichever form it was typed in.
+	fast := crypto.KDFParams{MemoryKiB: 8 * 1024, Iterations: 1, Parallelism: 1}
+	for name, typed := range map[string]string{
+		"decomposed":  "Grüsse aus dem Tresor",
+		"precomposed": "Grüsse aus dem Tresor",
+	} {
+		kek, err := crypto.Passphrase(typed).Derive(&crypto.Slot{Salt: salt, KDF: fast})
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkHex(t, "passphrase KEK, "+name, kek, v.PassphraseKEK)
+	}
+
+	keyfile := crypto.KeyfileSecret(sequence(0x30, crypto.KeyLen))
+	keyfileSlot := &crypto.Slot{Type: crypto.SlotKeyfile, UUID: slotUUID, Nonce: sequence(0x80, crypto.NonceLen), Salt: salt}
+	if err := keyfileSlot.Reseal(crypto.CipherXChaCha20Poly1305, uuid, fmk, keyfile); err != nil {
+		t.Fatal(err)
+	}
+	checkHex(t, "key-file slot commitment", keyfileSlot.Commitment, v.KeyfileSlotCommit)
+	checkHex(t, "key-file slot wrapped key", keyfileSlot.Wrapped, v.KeyfileSlotWrapped)
+	stored := &crypto.Slot{
+		Type: crypto.SlotKeyfile, UUID: slotUUID, Nonce: sequence(0x80, crypto.NonceLen), Salt: salt,
+		Commitment: decode(t, v.KeyfileSlotCommit), Wrapped: decode(t, v.KeyfileSlotWrapped),
+	}
+	opened, err := stored.Unwrap(crypto.CipherXChaCha20Poly1305, uuid, keyfile)
+	if err != nil {
+		t.Fatalf("the recorded key-file slot no longer opens: %v", err)
+	}
+	checkHex(t, "master key from the key-file slot", opened, v.FMK)
 
 	sb := &format.Superblock{
 		VersionMajor: format.VersionMajor, VersionMinor: format.VersionMinor,
@@ -86,7 +153,8 @@ func TestFormatV1KnownAnswerVectors(t *testing.T) {
 	slot := &crypto.Slot{
 		Type: crypto.SlotPassphrase, UUID: slotUUID, Label: "known answer",
 		Nonce: sequence(0x80, crypto.NonceLen), Wrapped: sequence(0xa0, crypto.KeyLen+crypto.TagLen),
-		Salt: sequence(0xd0, 16), KDF: crypto.KDFParams{MemoryKiB: 64 * 1024, Iterations: 3, Parallelism: 4},
+		Commitment: sequence(0x10, crypto.CommitmentLen),
+		Salt:       salt, KDF: crypto.KDFParams{MemoryKiB: 64 * 1024, Iterations: 3, Parallelism: 4},
 	}
 	table := &format.SlotTable{Generation: 7, Slots: []*crypto.Slot{slot}}
 	tableBytes, err := table.Marshal(keys.Header)
@@ -116,7 +184,7 @@ func TestFormatV1KnownAnswerVectors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("known manifest frame no longer opens: %v", err)
 	}
-	if m.FormatVersion != 1 || m.Compression.Format != "none" || !m.IndexStored {
+	if m.FormatVersion != 2 || m.Compression.Format != "none" || !m.IndexStored {
 		t.Fatalf("unexpected known manifest: %+v", m)
 	}
 
@@ -134,6 +202,41 @@ func TestFormatV1KnownAnswerVectors(t *testing.T) {
 	}
 	if !reflect.DeepEqual(gotParity, wantParity) {
 		t.Fatalf("parity = %x, want %x", gotParity, wantParity)
+	}
+
+	writer, err := crypto.WriterFromSeed(decode(t, v.WriterSeed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Wipe()
+	checkHash(t, "writer public key", writer.Public().Bytes(), v.WriterPublicHash)
+	checkHex(t, "writer fingerprint", writer.Fingerprint(), v.WriterFingerprint)
+	signed := *sb
+	if err := signed.SignWriter(writer.Deterministic()); err != nil {
+		t.Fatal(err)
+	}
+	signed.Sign(keys.Header)
+	checkHash(t, "writer signature", signed.Signature, v.SignatureSHA256)
+	checkHash(t, "signed header", signed.Marshal(), v.SignedHeaderSHA256)
+
+	// It verifies under the right key only, and not once a field it covers has
+	// changed. (This header is a set of patterned values, not one a reader would
+	// accept, so it is checked as built rather than parsed back.)
+	if err := signed.VerifyWriter(writer.Public()); err != nil {
+		t.Fatalf("the signed header does not verify: %v", err)
+	}
+	other, err := crypto.WriterFromSeed(sequence(0x61, crypto.WriterSeedLen))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Wipe()
+	if signed.VerifyWriter(other.Public()) == nil {
+		t.Error("the signature verified under another writer's key")
+	}
+	tampered := signed
+	tampered.TailLength++
+	if tampered.VerifyWriter(writer.Public()) == nil {
+		t.Error("the signature still verified after the header changed")
 	}
 }
 

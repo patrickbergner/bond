@@ -1,8 +1,10 @@
 package container
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"hash"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,13 +28,18 @@ type volumeWriter struct {
 	logical int64 // payload bytes written across the whole set
 }
 
+// volumeFile is one file being written. Only the current one stays open: a
+// volume is synced and closed when the next begins, and opened again briefly at
+// the end to receive its header and mirror, so a set of thousands of volumes
+// never holds thousands of descriptors.
 type volumeFile struct {
 	path         string
-	f            *os.File
+	f            *os.File // nil once the volume has been closed
 	index        int
 	payloadStart int64
 	logicalStart int64
 	payloadBytes int64
+	digest       hash.Hash // SHA-256 of the payload slice, as written
 	tailBytes    int64
 }
 
@@ -40,29 +47,41 @@ type volumeFile struct {
 func newVolumeWriter(base string, maxVolumeBytes int64) (*volumeWriter, error) {
 	w := &volumeWriter{base: base, split: maxVolumeBytes > 0}
 	if w.split {
-		// The head of a volume and the metadata at the end of it are not
-		// payload, so they come off the budget.
-		w.limit = maxVolumeBytes - format.PayloadOffset - tailReserve
-
-		// The reserve is a courtesy, not a rule: it keeps the last volume
-		// under the limit in the ordinary case. When the limit is small enough
-		// that reserving would leave no room at all, it is given up and the
-		// final volume is simply allowed to run over by the size of the
-		// manifest. The mirrored header is not given up with it – every volume
-		// carries one, so it is part of the floor rather than part of the
-		// courtesy.
-		if w.limit < minVolumePayload {
-			w.limit = maxVolumeBytes - format.PayloadOffset - format.SuperblockSize
+		limit, err := VolumePayloadLimit(maxVolumeBytes)
+		if err != nil {
+			return nil, err
 		}
-		if w.limit < minVolumePayload {
-			return nil, fmt.Errorf("maxVolumeBytes of %d leaves no room for payload; use at least %d",
-				maxVolumeBytes, format.PayloadOffset+format.SuperblockSize+minVolumePayload)
-		}
+		w.limit = limit
 	}
 	if err := w.roll(); err != nil {
 		return nil, err
 	}
 	return w, nil
+}
+
+// VolumePayloadLimit is how many payload bytes one volume may hold under
+// maxVolumeBytes. A shard larger than this cannot be placed without the volume
+// exceeding the limit, so whoever chooses the shard size needs the number too.
+func VolumePayloadLimit(maxVolumeBytes int64) (int64, error) {
+	// The head of a volume and the metadata at the end of it are not
+	// payload, so they come off the budget.
+	limit := maxVolumeBytes - format.PayloadOffset - tailReserve
+
+	// The reserve is a courtesy, not a rule: it keeps the last volume
+	// under the limit in the ordinary case. When the limit is small enough
+	// that reserving would leave no room at all, it is given up and the
+	// final volume is simply allowed to run over by the size of the
+	// manifest. The mirrored header is not given up with it – every volume
+	// carries one, so it is part of the floor rather than part of the
+	// courtesy.
+	if limit < minVolumePayload {
+		limit = maxVolumeBytes - format.PayloadOffset - format.SuperblockSize
+	}
+	if limit < minVolumePayload {
+		return 0, fmt.Errorf("maxVolumeBytes of %d leaves no room for payload; use at least %d",
+			maxVolumeBytes, format.PayloadOffset+format.SuperblockSize+minVolumePayload)
+	}
+	return limit, nil
 }
 
 const (
@@ -78,8 +97,38 @@ const (
 	minVolumePayload = 64 << 10
 )
 
+// patch runs fn on the volume's file, opening and durably closing it again if
+// the volume has already been closed.
+func (vf *volumeFile) patch(fn func(f *os.File) error) error {
+	if vf.f != nil {
+		return fn(vf.f)
+	}
+	f, err := os.OpenFile(vf.path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	if err := fn(f); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
 // roll starts a new volume.
 func (w *volumeWriter) roll() error {
+	if w.cur != nil && w.cur.f != nil {
+		if err := w.cur.f.Sync(); err != nil {
+			return err
+		}
+		if err := w.cur.f.Close(); err != nil {
+			return err
+		}
+		w.cur.f = nil
+	}
 	index := len(w.files)
 	path := w.base
 	if w.split {
@@ -88,7 +137,7 @@ func (w *volumeWriter) roll() error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	f, err := createStaging(path)
 	if err != nil {
 		return err
 	}
@@ -108,10 +157,24 @@ func (w *volumeWriter) roll() error {
 		return err
 	}
 
-	vf := &volumeFile{path: path, f: f, index: index, payloadStart: start, logicalStart: w.logical}
+	vf := &volumeFile{path: path, f: f, index: index, payloadStart: start, logicalStart: w.logical, digest: sha256.New()}
 	w.files = append(w.files, vf)
 	w.cur = vf
 	return nil
+}
+
+// createStaging creates a staging file that did not exist a moment ago.
+//
+// A leftover from an interrupted run is removed first – the name, not what it
+// points at – and the file is then created exclusively. Opening with O_TRUNC
+// instead followed a symlink: in a working directory other users can write to,
+// a link planted under the predictable staging name had the backup truncate and
+// overwrite whatever it pointed at.
+func createStaging(path string) (*os.File, error) {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	return os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 }
 
 // WriteShard appends one shard, moving to a new volume first if this one is
@@ -125,6 +188,7 @@ func (w *volumeWriter) WriteShard(b []byte) error {
 	if _, err := w.cur.f.Write(b); err != nil {
 		return err
 	}
+	w.cur.digest.Write(b)
 	w.cur.payloadBytes += int64(len(b))
 	w.logical += int64(len(b))
 	return nil
@@ -160,38 +224,35 @@ func (w *volumeWriter) headerFor(sb *format.Superblock, vf *volumeFile) format.S
 	vs.VolumeCount = uint32(len(w.files))
 	vs.VolumeLogicalStart = uint64(vf.logicalStart)
 	vs.VolumeLogicalLen = uint64(vf.payloadBytes)
+	vs.PayloadSHA256 = vf.digest.Sum(nil)
 	return vs
 }
 
-// PatchHeaders writes each volume's own superblock at the front of it.
-func (w *volumeWriter) PatchHeaders(sb *format.Superblock, sign func(*format.Superblock)) error {
+// WriteHeaders writes each volume's own header twice: at the front of the file
+// and as the mirror that closes it.
+//
+// The two copies are one rendering, signed once. They have to be byte-identical
+// – that is how a reader knows there is nothing to choose between them – and a
+// writer signature is hedged, so signing the same header twice gives two
+// different signatures and two copies that look like a damaged pair.
+//
+// It cannot be done when a volume is rolled: the tail offset, shard count and
+// key commitment are only settled at Finish.
+func (w *volumeWriter) WriteHeaders(sb *format.Superblock, sign func(*format.Superblock) error) error {
 	for _, vf := range w.files {
 		vs := w.headerFor(sb, vf)
-		sign(&vs)
-		if _, err := vf.f.WriteAt(vs.Marshal(), 0); err != nil {
+		if err := sign(&vs); err != nil {
 			return err
 		}
-	}
-	return nil
-}
-
-// WriteMirrors closes every volume with a mirror of its own header.
-//
-// The mirror used to close only the last file, which left volume 1 and every
-// middle volume holding a single copy of their header: one flipped bit there
-// and the whole set was unopenable from any entry point, because openSet always
-// re-reads volume 1 and there was no second opinion anywhere in the set. Four
-// kilobytes per file buys back the promise the rest of the format keeps, that
-// everything outside the payload is stored twice.
-//
-// It cannot be done when the volume is rolled: the tail offset, shard count and
-// key commitment are only settled at Finish.
-func (w *volumeWriter) WriteMirrors(sb *format.Superblock, sign func(*format.Superblock)) error {
-	for _, vf := range w.files {
-		vs := w.headerFor(sb, vf)
-		sign(&vs)
-		at := vf.payloadStart + vf.payloadBytes + vf.tailBytes
-		if _, err := vf.f.WriteAt(vs.Marshal(), at); err != nil {
+		header := vs.Marshal()
+		mirrorAt := vf.payloadStart + vf.payloadBytes + vf.tailBytes
+		if err := vf.patch(func(f *os.File) error {
+			if _, err := f.WriteAt(header, mirrorAt); err != nil {
+				return err
+			}
+			_, err := f.WriteAt(header, 0)
+			return err
+		}); err != nil {
 			return err
 		}
 	}
@@ -200,17 +261,21 @@ func (w *volumeWriter) WriteMirrors(sb *format.Superblock, sign func(*format.Sup
 
 // WriteHead writes the key-slot tables, which live only in volume 1.
 func (w *volumeWriter) WriteHead(slotsA, slotsB []byte) error {
-	first := w.files[0].f
-	if _, err := first.WriteAt(slotsA, format.SlotTableAOffset); err != nil {
+	return w.files[0].patch(func(first *os.File) error {
+		if _, err := first.WriteAt(slotsA, format.SlotTableAOffset); err != nil {
+			return err
+		}
+		_, err := first.WriteAt(slotsB, format.SlotTableBOffset)
 		return err
-	}
-	_, err := first.WriteAt(slotsB, format.SlotTableBOffset)
-	return err
+	})
 }
 
 // Sync flushes every volume.
 func (w *volumeWriter) Sync() error {
 	for _, vf := range w.files {
+		if vf.f == nil {
+			continue // synced when it was closed
+		}
 		if err := vf.f.Sync(); err != nil {
 			return err
 		}
@@ -222,9 +287,13 @@ func (w *volumeWriter) Sync() error {
 func (w *volumeWriter) Close() error {
 	var err error
 	for _, vf := range w.files {
+		if vf.f == nil {
+			continue
+		}
 		if closeErr := vf.f.Close(); err == nil {
 			err = closeErr
 		}
+		vf.f = nil
 	}
 	return err
 }

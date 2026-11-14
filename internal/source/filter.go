@@ -60,7 +60,10 @@ type Options struct {
 
 // DefaultOptions matches the behaviour of the filesystem BOND is running on.
 func DefaultOptions() Options {
-	return Options{CaseInsensitive: runtime.GOOS == "windows"}
+	// macOS volumes are case-insensitive unless someone chose otherwise, like
+	// Windows ones: "Thumbs.db" in an exclusion has to cover "thumbs.db" there
+	// as well.
+	return Options{CaseInsensitive: runtime.GOOS == "windows" || runtime.GOOS == "darwin"}
 }
 
 // NewFilter compiles one source's filter rules.

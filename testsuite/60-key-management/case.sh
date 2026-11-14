@@ -1,7 +1,7 @@
 # Changing who can open a backup, without touching the backup.
 #
 # The claim being tested is the one in NERDME §5: adding, removing and rotating
-# a key rewrites a fixed 64 KiB and never a byte of payload – the same work on
+# a key rewrites a fixed 128 KiB and never a byte of payload – the same work on
 # a terabyte as on a megabyte. That is checkable from outside the process, and
 # outside the process is the only place it counts, so this case takes a copy of
 # the payload region before each operation and compares it afterwards.
@@ -114,25 +114,26 @@ expect_out "payload       untouched"
 assert_payload_untouched
 BOND_ROTATED="$NEW_PASS-rotated" bond_ok list "$container" --passphrase-env BOND_ROTATED
 
-# The next three steps pin down the thing about rotation that surprises people,
-# and they assert it deliberately rather than by accident.
+# Rotation is revocation for anyone who has only the container, and this step is
+# what holds it to that.
 #
-# A key change writes the new slot table over the *older* of the two copies and
-# leaves the newer one alone, which is what makes the operation atomic without a
-# journal. The consequence is that the previous slot set is still on the disk
-# and still genuinely authentic, and NERDME §5 says readers fall back to it –
-# so the passphrase that was just rotated away opens the container until a
-# second key change overwrites the copy holding it.
+# A key change writes the new slot table into the copy that is not current,
+# reads it back, and then writes it over the one that was. The second write is
+# the point: with the previous table left in the file, a reader falls back to it
+# and the passphrase that was just rotated away goes on opening the container
+# until some later key change happens to overwrite that copy. NERDME §5.
 #
-# That is documented, deliberate, and not the same thing as revocation. If it
-# ever stops being true, this case should be the thing that says so, because the
-# fix would be a change to what an operator has been told to expect.
-step "the rotated-away passphrase still opens it, because the previous slot table is still there"
-bond_ok list "$container" --passphrase-env BOND_TEST_PASS
+# What rotation cannot do is reach a copy of the file somebody kept from before;
+# that takes `bond rekey`, further down.
+step "the checksum file follows a key change, so the quick check still passes"
+bond_ok verify "$container" --quick
 
-step "a second key change overwrites that copy, and only then is the old passphrase refused"
-BOND_ROTATED="$NEW_PASS-rotated" bond_with_stdin "a third secret" \
-    keys add "$container" --new-passphrase --label "the third" --passphrase-env BOND_ROTATED
+step "the rotated-away passphrase is refused at once"
+bond_fail list "$container" --passphrase-env BOND_TEST_PASS
+expect_err "wrong passphrase or key"
+
+step "another key can still be added, and the old passphrase stays refused"
+BOND_ROTATED="$NEW_PASS-rotated" bond_with_stdin "a third secret" keys add "$container" --new-passphrase --label "the third" --passphrase-env BOND_ROTATED
 [ "$BOND_STATUS" -eq 0 ] || fail "adding a third passphrase exited $BOND_STATUS"
 assert_payload_untouched
 bond_fail list "$container" --passphrase-env BOND_TEST_PASS
@@ -182,3 +183,6 @@ step "rekey refuses to write over something that is already there"
 BOND_REKEYED="a master key nobody has ever seen" bond_fail rekey "$container" --out "$CASE_TMP/rekeyed.bond" \
     --passphrase-env BOND_REKEYED
 expect_err "already exists"
+
+step "the re-encrypted copy has a checksum file of its own, as the original did"
+bond_ok verify "$CASE_TMP/rekeyed.bond" --quick

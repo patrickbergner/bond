@@ -31,6 +31,23 @@ type Reader struct {
 	manifest *format.Manifest
 	unlocked bool
 
+	// manifestRaw is the sealed manifest as stored, kept so repair can write an
+	// intact copy back; manifestDamaged names the copies (0, 1) that are not.
+	manifestRaw     []byte
+	manifestDamaged []int
+
+	// recovered counts data shards that failed on the read path and were
+	// rebuilt in memory from the stripe's recovery data.
+	recovered int
+
+	// expect is the writer the caller said to expect, and writerChecked says
+	// whether every volume's header was found signed by it.
+	expect        *crypto.WriterPublic
+	writerChecked bool
+
+	// openedWith is the kind of slot the unlock went through.
+	openedWith crypto.SlotType
+
 	// notices records what had to be worked around to open this container. An
 	// empty list means every first choice was intact.
 	notices []string
@@ -62,7 +79,7 @@ func (r *Reader) Volumes() int { return r.vols.Count() }
 func (r *Reader) Paths() []string { return r.vols.Paths() }
 
 func (r *Reader) readSlotTables() error {
-	first := r.vols.First().f
+	first := r.vols.First()
 	a := make([]byte, format.SlotTableSize)
 	b := make([]byte, format.SlotTableSize)
 	if _, err := first.ReadAt(a, format.SlotTableAOffset); err != nil {
@@ -152,6 +169,11 @@ type UnlockOptions struct {
 	// OnKDFDerivation is called immediately before an admitted Argon2
 	// derivation. It is intended for diagnostics and resource-policy tests.
 	OnKDFDerivation func(crypto.KDFParams)
+
+	// ExpectWriter, if set, refuses a container whose every volume header is
+	// not signed by this writer key. A container that only a public key was
+	// needed to write proves nothing about who wrote it, and this is what does.
+	ExpectWriter *crypto.WriterPublic
 }
 
 // Unlock tries each secret against each slot, then authenticates everything
@@ -190,6 +212,7 @@ func (r *Reader) UnlockWithOptions(opts UnlockOptions, secrets ...crypto.Unlocke
 		opts.KDFPolicy = crypto.DefaultKDFPolicy
 	}
 	budget := &unlockBudget{policy: opts.KDFPolicy, onDerivation: opts.OnKDFDerivation}
+	r.expect = opts.ExpectWriter
 	cache := make(map[[32]byte]unwrapResult)
 	defer func() {
 		for _, result := range cache {
@@ -269,13 +292,15 @@ type unwrapResult struct {
 	err error
 }
 
-func unwrapAttemptID(containerUUID []byte, slot *crypto.Slot, secretIndex int) [32]byte {
+func unwrapAttemptID(containerUUID []byte, cipher uint32, slot *crypto.Slot, secretIndex int) [32]byte {
 	h := sha256.New()
 	h.Write(containerUUID)
+	h.Write(binary.LittleEndian.AppendUint32(nil, cipher))
 	h.Write([]byte{byte(slot.Type)})
 	h.Write(slot.UUID)
 	h.Write(slot.Nonce)
 	h.Write(slot.Wrapped)
+	h.Write(slot.Commitment)
 	h.Write(slot.Salt)
 	var numbers [20]byte
 	binary.LittleEndian.PutUint32(numbers[0:], slot.KDF.MemoryKiB)
@@ -336,6 +361,9 @@ func (r *Reader) noteMetadata() {
 	if msg := r.slotNotice(); msg != "" {
 		r.note(msg)
 	}
+	if msg := r.manifestNotice(); msg != "" {
+		r.note(msg)
+	}
 }
 
 // slotNotice is the same judgement for the key-slot tables.
@@ -357,10 +385,11 @@ func (r *Reader) slotNotice() string {
 
 func (r *Reader) unlockWith(secrets []crypto.Unlocker, budget *unlockBudget, cache map[[32]byte]unwrapResult) error {
 	var fmk crypto.FMK
-	var policyErr error
+	var policyErr, damagedErr error
+	var opened crypto.SlotType
 	for _, slot := range r.table().Slots {
 		for secretIndex, secret := range secrets {
-			attempt := unwrapAttemptID(r.sb.ContainerUUID, slot, secretIndex)
+			attempt := unwrapAttemptID(r.sb.ContainerUUID, uint32(r.sb.Cipher), slot, secretIndex)
 			result, found := cache[attempt]
 			if !found {
 				passphraseAttempt := false
@@ -393,10 +422,20 @@ func (r *Reader) unlockWith(secrets []crypto.Unlocker, budget *unlockBudget, cac
 			if errors.Is(err, crypto.ErrWrongKey) {
 				continue
 			}
+			// The right key for a slot whose contents are damaged. Another slot,
+			// or the other table, may still open; it is remembered so that the
+			// refusal, if it comes to one, says damage and not "wrong key".
+			if errors.Is(err, crypto.ErrSlotDamaged) {
+				if damagedErr == nil {
+					damagedErr = err
+				}
+				continue
+			}
 			if err != nil {
 				return err
 			}
 			fmk = key
+			opened = slot.Type
 			break
 		}
 		if fmk != nil {
@@ -404,6 +443,9 @@ func (r *Reader) unlockWith(secrets []crypto.Unlocker, budget *unlockBudget, cac
 		}
 	}
 	if fmk == nil {
+		if damagedErr != nil {
+			return damagedErr
+		}
 		if policyErr != nil {
 			return fmt.Errorf("%w; use --allow-expensive-kdf only if these parameters are expected", policyErr)
 		}
@@ -422,6 +464,17 @@ func (r *Reader) unlockWith(secrets []crypto.Unlocker, budget *unlockBudget, cac
 		keys.Wipe()
 		return err
 	}
+	// The writer is checked on the copies the key settled on. A container
+	// someone built from the recipient's public key passes everything above –
+	// its MAC is its own – and this is the check it cannot pass.
+	if r.expect != nil {
+		for _, v := range r.vols.vols {
+			if err := v.sb.VerifyWriter(r.expect); err != nil {
+				keys.Wipe()
+				return fmt.Errorf("%s: %w", filepath.Base(v.path), err)
+			}
+		}
+	}
 	if err := r.table().Verify(keys.Header); err != nil {
 		keys.Wipe()
 		return err
@@ -437,6 +490,37 @@ func (r *Reader) unlockWith(secrets []crypto.Unlocker, budget *unlockBudget, cac
 		r.keys, r.manifest = nil, nil
 		keys.Wipe()
 		return err
+	}
+	r.openedWith = opened
+	r.writerChecked = r.expect != nil
+	return nil
+}
+
+// OpenedWith is the kind of slot the container was unlocked through.
+func (r *Reader) OpenedWith() crypto.SlotType { return r.openedWith }
+
+// WriterChecked reports whether every volume was found signed by the writer the
+// caller said to expect.
+func (r *Reader) WriterChecked() bool { return r.writerChecked }
+
+// Signer names the writer that signed the first volume's header, or returns nil
+// for an unsigned container. Before WriterChecked it is a claim and nothing more.
+func (r *Reader) Signer() []byte {
+	if r.sb.SignatureScheme == format.SignatureNone {
+		return nil
+	}
+	return r.sb.SignerID
+}
+
+// checkWriterEverywhere holds a freshly written container to its signature in
+// every copy of every header, as AuthenticateWithKeys holds it to its MAC.
+func (r *Reader) checkWriterEverywhere(pub *crypto.WriterPublic) error {
+	for _, v := range r.vols.vols {
+		for _, c := range v.scan.copies {
+			if err := c.sb.VerifyWriter(pub); err != nil {
+				return fmt.Errorf("%s %s: %w", filepath.Base(v.path), c.source, err)
+			}
+		}
 	}
 	return nil
 }
@@ -456,27 +540,54 @@ func (r *Reader) readManifest() error {
 			filepath.Base(last.path), manifestEnd, last.size)
 	}
 
+	// Both copies are looked at even when the first one opens. The second is
+	// only hashed – the header's digest is authenticated by now, so a copy that
+	// matches it is the copy that was written – but it has to be looked at: a
+	// container whose spare manifest has rotted opens perfectly on the first,
+	// and is one flip from holding a payload nobody can interpret.
+	r.manifest, r.manifestRaw, r.manifestDamaged = nil, nil, nil
 	var problems []error
 	for copyIndex := range 2 {
 		buf := make([]byte, r.sb.TailLength)
 		off := int64(r.sb.TailOffset + uint64(copyIndex)*r.sb.TailLength)
-		if _, err := r.vols.Last().f.ReadAt(buf, off); err != nil {
+		if _, err := r.vols.Last().ReadAt(buf, off); err != nil {
 			problems = append(problems, err)
+			r.manifestDamaged = append(r.manifestDamaged, copyIndex)
 			continue
 		}
 		if sum := sha256.Sum256(buf); subtle.ConstantTimeCompare(sum[:], r.sb.TailSHA256) != 1 {
 			problems = append(problems, fmt.Errorf("copy %d does not match the digest in the header", copyIndex+1))
+			r.manifestDamaged = append(r.manifestDamaged, copyIndex)
+			continue
+		}
+		if r.manifest != nil {
 			continue
 		}
 		m, err := format.OpenManifest(buf, r.sb.Cipher, r.keys.Manifest, r.sb.ContainerUUID)
 		if err != nil {
 			problems = append(problems, err)
+			r.manifestDamaged = append(r.manifestDamaged, copyIndex)
 			continue
 		}
-		r.manifest = m
-		return nil
+		r.manifest, r.manifestRaw = m, buf
 	}
-	return fmt.Errorf("both copies of the manifest are unusable: %v", errors.Join(problems...))
+	if r.manifest == nil {
+		return fmt.Errorf("both copies of the manifest are unusable: %v", errors.Join(problems...))
+	}
+	return nil
+}
+
+// manifestNotice says which manifest copy is damaged, or "" when both are
+// intact.
+func (r *Reader) manifestNotice() string {
+	if len(r.manifestDamaged) == 0 {
+		return ""
+	}
+	which := "second"
+	if r.manifestDamaged[0] == 0 {
+		which = "first"
+	}
+	return "the " + which + " copy of the manifest is damaged; only one copy of the file index and settings is left"
 }
 
 func (r *Reader) readManifestStrict() error {
@@ -489,7 +600,7 @@ func (r *Reader) readManifestStrict() error {
 	for copyIndex := range 2 {
 		buf := make([]byte, r.sb.TailLength)
 		off := int64(r.sb.TailOffset + uint64(copyIndex)*r.sb.TailLength)
-		if _, err := last.f.ReadAt(buf, off); err != nil {
+		if _, err := last.ReadAt(buf, off); err != nil {
 			return fmt.Errorf("reading manifest copy %d: %w", copyIndex+1, err)
 		}
 		if sum := sha256.Sum256(buf); subtle.ConstantTimeCompare(sum[:], r.sb.TailSHA256) != 1 {
@@ -513,8 +624,8 @@ func (r *Reader) readManifestStrict() error {
 func (r *Reader) crossCheck() error {
 	m := r.manifest
 	switch {
-	case m.StreamLength != int64(r.sb.StreamLength):
-		return fmt.Errorf("the manifest says the stream is %d bytes, the header says %d", m.StreamLength, r.sb.StreamLength)
+	case m.PaddedLength != int64(r.sb.StreamLength):
+		return fmt.Errorf("the manifest says the padded stream is %d bytes, the header says %d", m.PaddedLength, r.sb.StreamLength)
 	case m.DataShardCount != int64(r.sb.DataShardCount):
 		return fmt.Errorf("the manifest counts %d shards, the header counts %d", m.DataShardCount, r.sb.DataShardCount)
 	case m.ShardSize != int64(r.sb.ShardSize):
@@ -566,7 +677,7 @@ func describeSlots(slots []*crypto.Slot) string {
 		}
 		out += s.Type.String()
 		if s.Label != "" {
-			out += " (" + s.Label + ")"
+			out += " (" + s.DisplayLabel() + ")"
 		}
 	}
 	return "these key slots: " + out
@@ -584,9 +695,11 @@ func (r *Reader) Stream() (io.Reader, error) {
 		return nil, err
 	}
 	return &shardReader{
-		r:         r,
-		aead:      aead,
-		remaining: int64(r.sb.StreamLength),
+		r:    r,
+		aead: aead,
+		// The stream's own length, from the manifest: what the shards hold
+		// beyond it is padding and is never handed on.
+		remaining: r.manifest.StreamLength,
 	}, nil
 }
 
@@ -599,6 +712,9 @@ type shardReader struct {
 	buf     []byte
 	scratch []byte
 	pos     int
+	stripe  stripeCache
+
+	finished bool
 
 	remaining int64
 	err       error
@@ -609,6 +725,10 @@ func (s *shardReader) Read(p []byte) (int, error) {
 		return 0, s.err
 	}
 	if s.remaining == 0 {
+		if err := s.finish(); err != nil {
+			s.err = err
+			return 0, err
+		}
 		return 0, io.EOF
 	}
 	if s.pos >= len(s.buf) {
@@ -626,18 +746,161 @@ func (s *shardReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+// finish reads what lies beyond the end of the stream before the reader says
+// EOF: the rest of the current shard and every shard after it.
+//
+// All of that is padding, and none of it is handed on. It is read anyway,
+// because the promise of a restore is that the container it came from
+// authenticated from end to end – a shard nobody looked at is a shard that
+// could hold anything – and because padding that is not zeros is not something
+// this format writes.
+func (s *shardReader) finish() error {
+	if s.finished {
+		return nil
+	}
+	for {
+		for _, b := range s.buf[min(s.pos, len(s.buf)):] {
+			if b != 0 {
+				return errors.New("the padding after the end of the stream is not empty; this container was not written by BOND")
+			}
+		}
+		if s.index >= s.r.sb.DataShardCount {
+			break
+		}
+		if err := s.next(); err != nil {
+			return err
+		}
+	}
+	s.buf, s.pos = nil, 0
+	s.finished = true
+	return nil
+}
+
 func (s *shardReader) next() error {
 	if s.index >= s.r.sb.DataShardCount {
 		return io.ErrUnexpectedEOF
 	}
 	plain, sealed, err := s.r.readShard(s.aead, s.index, s.scratch)
-	if err != nil {
-		return err
-	}
 	s.scratch = sealed
+	if err != nil {
+		// The recovery data is in the same file, so a damaged shard is rebuilt
+		// here rather than stopping the read and sending the operator off to
+		// write a repaired copy of the whole container first – which, in the
+		// middle of a real recovery, is the worst moment to need the space
+		// twice. The rule that nothing unauthenticated is handed on still
+		// holds: the rebuilt shard has to pass its own tag.
+		rebuilt, rebuildErr := s.r.recoverShard(s.aead, s.index, &s.stripe)
+		if rebuildErr != nil {
+			return fmt.Errorf("%w; it could not be rebuilt: %v", err, rebuildErr)
+		}
+		plain = rebuilt
+	}
 	s.buf, s.pos = plain, 0
 	s.index++
 	return nil
+}
+
+// stripeCache holds what the last reconstruction rebuilt, so several damaged
+// shards in one stripe cost one reconstruction.
+type stripeCache struct {
+	valid  bool
+	stripe int
+	plain  map[uint64][]byte
+}
+
+// RecoveredShards is how many damaged data shards were rebuilt from the
+// recovery data while the payload was being read. Anything above zero means the
+// container is damaged and should be repaired.
+func (r *Reader) RecoveredShards() int { return r.recovered }
+
+// recoverShard returns the plaintext of a data shard that failed on the read
+// path, rebuilt from its stripe.
+func (r *Reader) recoverShard(aead shardOpener, index uint64, cache *stripeCache) ([]byte, error) {
+	l := r.sb.Layout()
+	if !l.Plan.Enabled() {
+		return nil, errors.New("this container carries no recovery data")
+	}
+	s, _ := l.StripeOf(index)
+	if !cache.valid || cache.stripe != s {
+		plain, err := r.rebuildStripe(aead, s)
+		if err != nil {
+			return nil, err
+		}
+		*cache = stripeCache{valid: true, stripe: s, plain: plain}
+	}
+	plain, ok := cache.plain[index]
+	if !ok {
+		return nil, fmt.Errorf("shard %d could not be read, but its stripe authenticates when read again", index)
+	}
+	return plain, nil
+}
+
+// rebuildStripe reads one stripe, authenticates every shard of it and rebuilds
+// the data shards that fail, returning their plaintext by shard index.
+//
+// Reed-Solomon reconstructs and the tag decides whether the reconstruction is
+// right, exactly as in Repair: a shard that does not authenticate goes in as
+// missing, never as data, and a rebuilt one is returned only if it opens.
+func (r *Reader) rebuildStripe(aead shardOpener, s int) (map[uint64][]byte, error) {
+	l := r.sb.Layout()
+	coder, err := parity.NewCoder(l.Plan)
+	if err != nil {
+		return nil, err
+	}
+	width := l.DataInStripe(s)
+	first := uint64(s) * uint64(l.Plan.Data)
+
+	data := make([][]byte, width)
+	lengths := make([]uint32, width)
+	var lost []int
+	for j := range width {
+		index := first + uint64(j)
+		lengths[j] = l.DataLen(index)
+		raw, err := r.rawShard(index)
+		if err != nil || !shardAuthenticates(aead, r.sb, index, raw) {
+			lost = append(lost, j)
+			continue
+		}
+		data[j] = raw
+	}
+
+	parityShards := make([][]byte, l.ParityInStripe(s))
+	lostParity := 0
+	for q := range parityShards {
+		raw, err := r.readParity(aead, s, q)
+		if err != nil {
+			lostParity++
+			continue
+		}
+		parityShards[q] = raw
+	}
+	if len(lost)+lostParity > len(parityShards) {
+		return nil, fmt.Errorf("stripe %d has lost %d shards and its recovery data covers %d",
+			s, len(lost)+lostParity, len(parityShards))
+	}
+
+	if err := coder.Reconstruct(data, parityShards, lengths, l.ShardLen(s)); err != nil {
+		return nil, fmt.Errorf("stripe %d: %w", s, err)
+	}
+
+	plain := make(map[uint64][]byte, len(lost))
+	for _, j := range lost {
+		index := first + uint64(j)
+		nonce := crypto.ShardNonce(r.sb.NoncePrefix, index)
+		aad := crypto.ShardAAD(r.sb.ContainerUUID, index, r.sb.ShardSize)
+		opened, err := aead.Open(nil, nonce, data[j], aad)
+		if err != nil {
+			return nil, fmt.Errorf("shard %d was rebuilt but does not authenticate; the recovery data cannot restore it", index)
+		}
+		plain[index] = opened
+	}
+	r.recovered += len(lost)
+	return plain, nil
+}
+
+// shardOpener is the half of an AEAD that reading needs.
+type shardOpener interface {
+	Open(dst, nonce, ct, ad []byte) ([]byte, error)
 }
 
 // readShard reads one sealed data shard and authenticates it.
@@ -755,7 +1018,7 @@ func (r *Reader) Verify(progress func(shard, total uint64)) (Report, error) {
 	l := r.sb.Layout()
 	rep := Report{Shards: r.sb.DataShardCount, ParityShards: l.ParityShardCount()}
 	digest := sha256.New()
-	remaining := int64(r.sb.StreamLength)
+	remaining := r.manifest.StreamLength
 
 	var scratch []byte
 	for i := uint64(0); i < r.sb.DataShardCount; i++ {

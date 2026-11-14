@@ -179,7 +179,7 @@ if [ "$BOND_STATUS" -ne 0 ] && printf '%s' "$BOND_OUT" | grep -q 'could not be r
     step "--ignore-errors stores what can be read, and the run still fails so nobody calls it complete"
     bond_fail backup --config "$cfg" --ignore-errors
     partial="$(container_in "$CASE_TMP/output-partial")"
-    bond_ok verify "$partial"
+    bond_ok verify --allow-unencrypted "$partial"
     expect_out "OK"
 
     step "and what it did store comes back"
@@ -188,7 +188,7 @@ if [ "$BOND_STATUS" -ne 0 ] && printf '%s' "$BOND_OUT" | grep -q 'could not be r
     # the entry reaches the container and the extraction policy then declines
     # to write a path the filesystem would silently rename. Either answer is
     # right. Writing the readable file to the wrong name would not be.
-    bond restore "$partial" --to "$CASE_TMP/restored-partial"
+    bond restore --allow-unencrypted "$partial" --to "$CASE_TMP/restored-partial"
     if [ "$BOND_STATUS" -ne 0 ]; then
         expect_err "ends in a space or dot, which Windows silently strips"
     fi
@@ -238,14 +238,18 @@ config_write "$cfg"
 bond_ok backup --config "$cfg"
 plain="$(container_in "$plain_out")"
 
-bond_with_stdin "second key" keys add "$plain" --new-passphrase --label "added later"
+bond_with_stdin "too short" keys add "$plain" --allow-unencrypted --new-passphrase --label "added later"
+[ "$BOND_STATUS" -eq 1 ] || fail "a nine-character passphrase was accepted for a new slot (exit $BOND_STATUS)"
+expect_err "at least 12 characters"
+
+bond_with_stdin "a second key, added later" keys add "$plain" --allow-unencrypted --new-passphrase --label "added later"
 [ "$BOND_STATUS" -eq 0 ] || fail "adding a passphrase slot to a NONE container exited $BOND_STATUS"
 
-bond_fail keys remove "$plain" --slot 0 --yes
+bond_fail keys remove "$plain" --allow-unencrypted --slot 0 --yes
 expect_err "bond rekey"
 
 step "and the container still opens afterwards"
-bond_ok verify "$plain"
+bond_ok verify --allow-unencrypted "$plain"
 expect_out "OK"
 
 # Publishing over an occupied namespace is not driven from here. Container
@@ -253,3 +257,27 @@ expect_out "OK"
 # and manufacturing the collision would mean predicting that timestamp. The
 # refusal and the message that names every file in the way are proved in
 # internal/container's publication tests instead.
+
+# ---------------------------------------------------------------------------
+# The plaintext slot is never taken on the container's word. The slot table is
+# read before anything authenticates it, so whoever stores the file decides
+# whether it lists one. This container has a plaintext slot and a passphrase
+# slot: exactly what a substituted backup would look like.
+step "without the opt-in it asks for a key like any other container, and restores nothing"
+bond_fail verify "$plain"
+expect_err "passphrase"
+bond_fail restore "$plain" --to "$CASE_TMP/restored-unasked"
+[ ! -e "$CASE_TMP/restored-unasked" ] || fail "a refused restore still wrote to its destination"
+
+step "a passphrase that does not open it is not rescued by the plaintext slot"
+BOND_WRONG="not the passphrase of any slot" bond_fail restore "$plain" --to "$CASE_TMP/restored-decoy" --passphrase-env BOND_WRONG
+expect_err "wrong passphrase or key"
+[ ! -e "$CASE_TMP/restored-decoy" ] || fail "a restore with the wrong passphrase wrote to its destination"
+
+step "the opt-in and a key are one or the other"
+BOND_SECOND="a second key, added later" bond_usage verify "$plain" --allow-unencrypted --passphrase-env BOND_SECOND
+BOND_SECOND="a second key, added later" bond_ok verify "$plain" --passphrase-env BOND_SECOND
+
+step "the opt-in does not open a container that is encrypted"
+bond_fail verify "$container" --allow-unencrypted
+expect_err "not unencrypted"

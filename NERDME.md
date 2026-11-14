@@ -1,11 +1,20 @@
 # NERDME – how BOND actually works
 
-The authoritative description of the BOND container format, version 1.0. [README.md](README.md) is the operator's
+The authoritative description of the BOND container format, version 2.0. [README.md](README.md) is the operator's
 guide; this is everything underneath it.
+
+Format 2.0 is the only format this build reads or writes. It differs from 1.0 in four places, each described where
+it applies: every key slot carries a key commitment ([§4](#4-key-model)); associated data, MAC inputs and combined
+secrets are length-prefixed tuples rather than concatenations ([§4](#4-key-model)); a passphrase is hashed in Unicode
+normalization form C ([§4](#4-key-model)); and the stream and the manifest are padded, so a container's size no
+longer gives the size of what is in it ([§6](#6-payload-shards-and-recovery-data), [§8](#8-manifest)).
 
 ## 1. The pipeline
 
-One pass each way, nothing buffered to disk. A backup of a terabyte needs a terabyte of destination and nothing else.
+One pass each way, nothing buffered to disk. A backup of a terabyte needs a terabyte of space and nothing else: no
+temporary archive, no second copy. That space is on the destination's filesystem, because the container is assembled
+in `workPath` and renamed into place, and a rename cannot cross filesystems. `bond repair` and `bond rekey` are the
+two operations that do need a second full copy, since each writes a new container beside the one it reads.
 
 ```
   files on disk
@@ -18,6 +27,7 @@ One pass each way, nothing buffered to disk. A backup of a terabyte needs a tera
         │  xz / LZMA2                                                           │
         ▼                                                                       │
   compressed stream                    ── SHA-256 of the whole stream ──┐       │
+        │  zero-padded to its Padmé length,                             │       │
         │  split into shardSize-16 chunks                               │       │
         ▼                                                               ▼       ▼
   XChaCha20-Poly1305 per shard         internal/crypto            manifest (sealed)
@@ -28,8 +38,10 @@ One pass each way, nothing buffered to disk. A backup of a terabyte needs a tera
   └───────────────────────────────────────────────────────────────────────────┘
 ```
 
-Restore is the same picture backwards, with one rule added: a shard that fails its authentication tag stops the read.
-Nothing that failed authentication is ever handed to the decompressor.
+Restore is the same picture backwards, with one rule added: nothing that failed authentication is ever handed to the
+decompressor. A shard that fails its tag is rebuilt in memory from its stripe's recovery data when the stripe allows,
+and the rebuilt shard has to pass the same tag ([§6](#6-payload-shards-and-recovery-data)); where it cannot be
+rebuilt, the read stops there.
 
 ## 2. Container layout
 
@@ -50,7 +62,7 @@ and the last – but **the mirrored superblock closes every volume**, so no sing
 being unreadable. See [§6a](#6a-volumes).
 
 The fixed 132 KiB head is the price of [§5](#5-changing-a-key-never-touches-the-payload): because the slot tables never
-move and never change size, adding a key rewrites 64 KiB of a terabyte file.
+move and never change size, adding a key rewrites 128 KiB of a terabyte file.
 
 The manifest is stored twice because it is the one region with no parity of its own. A payload nobody can interpret is
 not a backup, and two copies cost a few hundred kilobytes.
@@ -83,7 +95,7 @@ that stays quiet is a region that never gets healed.
 | 40 | 4 | Data shards per stripe (k) |
 | 44 | 4 | Parity shards per stripe (p) |
 | 48 | 8 | Data shard count |
-| 56 | 8 | Compressed stream length, exact |
+| 56 | 8 | Stream length as stored: the compressed stream padded to its Padmé length ([§6](#6-payload-shards-and-recovery-data)) |
 | 64 | 8 | Creation time, Unix nanoseconds |
 | 72 | 16 | Container UUID, random |
 | 88 | 16 | Payload nonce prefix, random |
@@ -97,9 +109,13 @@ that stays quiet is a region that never gets healed.
 | 176 | 32 | Key commitment |
 | 208 | 32 | Header MAC |
 | 240 | 4 | On-disk size of the final shard |
-| 244 | 3852 | Reserved, zero |
+| 244 | 32 | SHA-256 of this volume's payload slice as stored (sealed data and parity shards, in file order) |
+| 276 | 4 | Writer signature scheme (0 = unsigned, 1 = Ed25519 + ML-DSA-65) |
+| 280 | 32 | Writer fingerprint: SHA-256 of the writer's public key; zero when unsigned |
+| 312 | 3373 | Writer signature: 64 bytes Ed25519, then 3309 bytes ML-DSA-65; zero when unsigned ([§4](#writer-signatures)) |
+| 3685 | 411 | Reserved, zero |
 
-Format 1.0 means exactly major 1, minor 0. Other versions and unknown flag bits are refused.
+Format 2.0 means exactly major 2, minor 0. Other versions – 1.0 included – and unknown flag bits are refused.
 
 The **header MAC** is `HMAC-SHA256(headerKey, superblock with bytes 208–239 zeroed)` and covers all 4096 bytes,
 reserved area included, so nothing can be smuggled into the padding.
@@ -109,7 +125,7 @@ difference is the whole of what that sentence promises. Marshalling a parsed hea
 reserved region, so a MAC computed that way never looks at what is really stored there – which left 3852 bytes per
 header copy that anyone could write to, on a container that would then pass `bond verify` reporting no damage at all.
 Reading the MAC over the raw bytes means corruption or unauthorized data in the reserved region is still detected.
-A future format must use a new declared version and is refused by this 1.0 reader rather than guessed at.
+A future format must use a new declared version and is refused by this 2.0 reader rather than guessed at.
 
 The honest limit: this stops anyone *without* the header key. A key holder can put whatever they like in the padding
 and sign it, and no reader can tell.
@@ -161,9 +177,15 @@ The container opened, but it did so on its last copy of something, and the next 
                                                                   │
                     ┌──────────────┬──────────────┬───────────────┴──────────┐
                     ▼              ▼              ▼                          ▼
-              "bond/v1/data"  "bond/v1/header"  "bond/v1/manifest"   "bond/v1/commit"
+              "bond/v2/data"  "bond/v2/header"  "bond/v2/manifest"   "bond/v2/commit"
                 dataKey        headerKey         manifestKey           commitKey
 ```
+
+**`T(x₁, …, xₙ)`**, the tuple encoding, is `LE32(len(x₁)) ‖ x₁ ‖ … ‖ LE32(len(xₙ)) ‖ xₙ`. Every associated data,
+every MAC input that combines more than one value, and the combined secret of the hybrid key exchange is one. Plain
+concatenation is unambiguous only while every field has a fixed length, and stops being so – with every test still
+passing – the day a variable-length field is placed beside another. With the lengths written down, no two different
+lists of values can produce the same bytes. A label such as `"BOND-DATA-V2"` stands for its ASCII bytes.
 
 The **File Master Key** is 32 bytes from `crypto/rand` and is never derived from a passphrase. That is what makes key
 changes cheap: every slot wraps the same FMK, so a new passphrase re-wraps 32 bytes rather than re-encrypting a
@@ -172,15 +194,21 @@ terabyte.
 The **container UUID is the HKDF salt**, so two containers never share a subkey even if they somehow shared a master
 key.
 
-The **key commitment** is `HMAC-SHA256(commitKey, "BOND-COMMIT-V1" ‖ containerUUID)`, stored in the header. AEAD tags
+The **key commitment** is `HMAC-SHA256(commitKey, T("BOND-COMMIT-V2", containerUUID))`, stored in the header. AEAD tags
 prove a ciphertext was made with the key that opens it, but not *which* key that was; without a commitment a container
 could in principle be crafted to open differently under two different secrets. The commitment is checked before
-anything else is trusted.
+anything else is trusted. Each key slot carries a commitment of its own as well, described with the slot record
+below; the two close the same gap at two levels.
 
 **`encryptionMethod: NONE`** is not a separate code path. BOND still generates an FMK, still seals every shard, and
 stores the FMK wrapped under an all-zero key-encryption key in a `plaintext` slot. The tags provide corruption
 detection, not adversarial authenticity: anyone holding the container can read it, recover the FMK and create modified
 content with valid tags. An external signature is required when malicious-tamper evidence matters.
+
+The plaintext slot is never used on the container's say-so. The slot table is parsed before a key exists to
+authenticate it, so whoever stores the file decides whether it lists such a slot, and a reader that tried it
+unasked would open a substituted container under any passphrase the operator typed, or under none. `bond` offers
+the plaintext secret only when `--allow-unencrypted` is given, and never together with another key.
 
 `FlagUnencrypted` in the header is advisory, and `bond keys remove` refuses to delete a plaintext slot. Neither is
 fussiness. The flag records what was true when the container was written and no key change may rewrite it – the
@@ -192,13 +220,14 @@ today still has it. `bond rekey` is the operation that changes who can read a ba
 
 ### Key-slot table
 
-Two tables at fixed offsets, 64 KiB each. A fresh container writes the same slots into both at generation 1; after
-that they alternate, and the higher generation is the current one.
+Two tables at fixed offsets, 64 KiB each. A fresh container writes the same slots into both at generation 1, and a
+key change leaves them identical again at the next generation. They differ only while a key change is in flight or
+after damage, and then the higher authentic generation is the current one.
 
 | Offset | Size | Field |
 |---:|---:|---|
 | 0 | 4 | Magic `BSLT` |
-| 4 | 2 | Version (1) |
+| 4 | 2 | Version (2) |
 | 6 | 2 | Slot count (max 32) |
 | 8 | 8 | Generation |
 | 16 | 4 | Bytes of records in use |
@@ -210,15 +239,16 @@ Each record:
 | Offset | Size | Field |
 |---:|---:|---|
 | 0 | 4 | Record size |
-| 4 | 2 | Record version (1) |
+| 4 | 2 | Record version (2) |
 | 6 | 1 | Slot type: 1 passphrase, 2 key file, 3 plaintext, 4 recipient |
 | 8 | 16 | Slot UUID |
 | 24 | 24 | Wrapping nonce |
 | 48 | 16 | Salt |
 | 64 | 12 | Argon2id memory (KiB), passes, lanes |
 | 76 | 4 | Wrapped length (48) |
-| 80 | 48 | The sealed master key |
-| 128 | 2 + n | Label length and UTF-8 label |
+| 80 | 32 | Key commitment |
+| 112 | 48 | The sealed master key |
+| 160 | 2 + n | Label length and UTF-8 label |
 | … | 4 + m | Key-exchange length and bytes – recipient slots only, otherwise 0 |
 
 Both 64 KiB tables are authenticated as the exact bytes read, including unused padding. Before Argon2 runs, a reader
@@ -236,9 +266,42 @@ came up early, reporting that its own default parameters exceeded the safety pol
 the memory ceiling on any single derivation; what bounds the total is that a table declares at most `maxSlots` slots
 and the derivations run one after another, never concurrently.
 
-The slot's associated data is `"BOND-SLOT-V1" ‖ containerUUID ‖ slotUUID ‖ slotType ‖ salt ‖ kdfParams`, with the key
-exchange in place of the KDF parameters for a recipient slot. Binding the cost parameters matters: without it, an
-attacker could lower the recorded memory and pass count to make guessing cheaper, and the tag would not notice.
+**How a slot wraps the master key.** Whatever the slot's kind, it ends in a 32-byte key-encryption key `KEK`:
+
+| Slot | KEK |
+|---|---|
+| passphrase | `Argon2id(NFC(passphrase), salt, passes, memoryKiB, lanes, 32)` |
+| key file | `HKDF-SHA512(keyfile bytes, salt, "bond/v2/keyfile-kek", 32)` |
+| plaintext | 32 zero bytes |
+| recipient | the hybrid exchange below |
+
+```
+K_enc      = HKDF-SHA512(KEK, no salt, "bond/v2/slot-enc", 32)
+K_com      = HKDF-SHA512(KEK, no salt, "bond/v2/slot-com", 32)
+aad        = T("BOND-SLOT-V2", containerUUID, slotUUID, slotType, salt, params)
+commitment = HMAC-SHA256(K_com, T(nonce, aad))
+wrapped    = XChaCha20-Poly1305(K_enc, nonce, FMK, aad)
+```
+
+`slotType` is one byte. `params` is `LE32(memoryKiB) ‖ LE32(passes) ‖ LE32(lanes)` for a passphrase slot, the stored
+key exchange for a recipient slot, and empty otherwise. Binding the cost parameters matters: without it, an attacker
+could lower the recorded memory and pass count to make guessing cheaper, and the tag would not notice.
+
+**The commitment is checked first**, in constant time, and a key that does not match it is a wrong key before
+anything is decrypted. XChaCha20-Poly1305 does not commit to its key: a wrapped key can be constructed that opens
+under several key-encryption keys at once. Whoever stores a container could swap in such a slot, built over a whole
+set of candidate passphrases, and learn from how a reader fails which set the real passphrase is in – many guesses
+for the price of one unlock. With the commitment a slot answers to exactly one key. It also separates two failures
+that used to look alike: a key that matches the commitment and still cannot open the wrapped key means the slot is
+damaged, not that the passphrase was mistyped, and the reader goes on to the other table.
+
+**The passphrase is hashed in normalization form C.** The same characters reach a program as different bytes
+depending on keyboard and operating system – an umlaut may arrive as one code point or as a letter and a combining
+mark – and a backup written on one machine and restored on another would otherwise be refused its own passphrase.
+Bytes that are not valid UTF-8 pass through unchanged.
+
+A new passphrase must have at least twelve characters. That is a rule of the tool where a passphrase is chosen, not
+of the format: a container opens with whatever it was written with.
 
 ### Recipient slots and the printed recovery key
 
@@ -272,28 +335,81 @@ Crockford's base32 alphabet omits I, L, O and U; the decoder accepts those anywa
 and hyphens are ignored wherever they fall; and a two-byte checksum catches what is left, so a mistyped key says so
 instead of quietly failing to open the backup.
 
+### Writer signatures
+
+A recipient slot is made from the public key alone, which is its point – and also its limit: whoever knows that key
+can build a complete container the recovery key opens, and nothing in it would tell that container from one the
+backup machine wrote. In a fleet the public key sits in a control file on every node, so "whoever knows it" is a
+large set. A writer key is what tells the two apart.
+
+`bond keygen --signing-key` makes one: a 32-byte seed from which an Ed25519 key and an ML-DSA-65 key are derived
+(`HKDF-SHA512(seed, no salt, "bond/v2/writer-ed25519", 32)` and `… "bond/v2/writer-mldsa65" …`, the latter as the
+FIPS 204 key-generation seed). The secret half stays on the machine that writes backups (`signingKey` in the control
+file); the public half, `Ed25519 public ‖ ML-DSA-65 public` (1984 bytes), goes wherever restores happen. Its
+fingerprint is the SHA-256 of those bytes.
+
+Every volume header is signed, and the signature is in the header (offsets 276–3684 in [§3](#3-superblock)):
+
+```
+message   = T("BOND-WRITER-V2", header with the MAC (208–239) and the signature (312–3684) zeroed)
+signature = Ed25519(message) ‖ ML-DSA-65(message, context "BOND-WRITER-V2")
+```
+
+The header MAC is computed afterwards, over the signature. The message covers everything else in the header: the
+scheme and fingerprint, the container UUID, the key commitment, the volume's place in its set, its payload digest
+(offset 244), and the manifest digest – which through the manifest covers the stream digest and the file index. A
+reader that has unlocked the container has therefore checked, under the signature, everything it restores.
+
+Both halves have to verify. Ed25519 holds against what is known today and ML-DSA against a quantum computer. ML-DSA-65
+rather than -87 because its signature fits the header's reserved area; its category 3 against ML-KEM-1024's category
+5 is a smaller gap than it looks, because a harvested ciphertext can be broken decades later, while a forged
+signature has to exist before the restore that would accept it. ML-DSA signing is hedged, so two signatures of the
+same header differ; a volume's two header copies are therefore one rendering written twice.
+
+A signature proves something only against a key the reader was told to expect, which is `--expect-writer`. Without
+it, `bond` reports which fingerprint a container claims and that it was not checked, and a container opened through a
+recipient slot with no signature at all is reported as such. The key-slot tables are not signed – they change with
+every key change – which is harmless: a slot only yields the master key the signed header commits to.
+
+The payload digest makes one more check possible: **with nothing but the writer's public key**, `bond verify --quick
+--expect-writer` confirms every volume's signature, hashes every payload slice against its signed digest, and checks
+the manifest copies against theirs. That is the whole container except the slot tables, proved unchanged since it
+was written by a job that holds no decryption key – which a checksum file beside the container, being as easy to
+replace as the container, cannot do.
+
+The writer key opens nothing. A machine holding one can vouch for what it writes and still cannot read it. What
+changes is that a compromised machine can now sign forgeries; but a compromised writer could always write whatever
+it liked, so the claim is "the machine can vouch for backups, not read them", and it holds.
+
 ## 5. Changing a key never touches the payload
 
 This is a design requirement, so the format is built for it rather than relying on care.
 
 The superblock **does not authenticate the slot tables**. If it did, adding a key would mean rewriting the superblock –
 and in a split container, the superblock in every volume. Instead each table carries its own MAC and its own
-generation counter, and the two tables alternate:
+generation counter, and a key change replaces them one after the other:
 
 1. Unlock the master key and authenticate both header copies and both slot tables.
 2. Select the highest authentic generation. Equal-generation authentic tables must be byte-identical, and the maximum
    generation cannot be incremented.
-3. Build the new slot set and write only the selected table's physical peer with `generation + 1`.
-4. fsync, re-read, parse and authenticate the new table before reporting success.
+3. Build the new slot set and write the selected table's physical peer with `generation + 1`.
+4. fsync, re-read, parse and authenticate the new table.
+5. Write the same bytes over the table selected in step 2, and fsync, re-read and authenticate that too before
+   reporting success.
 
-A crash between steps leaves the previous authentic table untouched. If only one authentic copy remains, it is
-preserved and the damaged peer is the one rewritten. Readers try authentic tables by generation. Total I/O for a key
-change on a terabyte container: 64 KiB.
+At every instant one authentic table is on disk. A crash before step 4 completes leaves the previous table as the
+highest authentic generation; a crash between steps 4 and 5 leaves the new one current and the previous one still
+present, which running the command again clears. If only one authentic copy exists to begin with, the damaged peer
+is the one written first. Total I/O for a key change on a terabyte container: 128 KiB.
 
-That fallback is availability, not a weakening of `bond keys remove`. Rolling a container back to an older slot set is
-already open to anyone who can write to the file – destroy the newer table's magic and the older one is picked, and it
-is genuinely authentic, because it was. What the fallback removes is the case where the same one-byte edit denies
-access to *everyone* instead. A removed key that must stay removed is removed with `bond rekey`, which changes the
+Step 5 is what makes `bond keys remove` and `rotate-passphrase` mean what they say. Readers try every table that
+parses, newest first, because a flipped bit can leave the newer one structurally perfect and merely unauthentic.
+With the previous table left in place that same fallback let a removed key go on opening the container, with no
+tampering at all, until a later key change happened to land on that copy.
+
+What no key change can reach is a copy of the file from before it. An older slot table is genuinely authentic,
+because it was, and someone who kept the old file – or a storage provider that serves it again – still has a
+container the old key opens. A removed key that must stay removed is removed with `bond rekey`, which changes the
 master key itself and leaves nothing for an old slot to unwrap.
 
 Rotating the *master key* is genuinely a full rewrite, and gets its own command – `bond rekey` – that says so before
@@ -311,12 +427,36 @@ a 16-byte Poly1305 tag.
 
 - **Nonce**: `noncePrefix ‖ LE64(shardIndex)` – 16 random bytes per container, then the index. Derived rather than
   stored: an index is unique within a container by construction, so the same nonce cannot occur twice under one key.
-- **Associated data**: `"BOND-DATA-V1" ‖ containerUUID ‖ LE64(shardIndex) ‖ LE32(shardSize)`. Without the index a
+- **Associated data**: `T("BOND-DATA-V2", containerUUID, LE64(shardIndex), LE32(shardSize))`. Without the index a
   shard could be moved or repeated within the container and still authenticate; without the UUID a shard from another
   container under the same key would too. A tag alone notices neither.
 - **The last shard is short.** It is sealed at whatever length it reached. Padding it would waste up to a full shard
   on every container – for a 444 KiB backup that was the difference between 4.13 MiB and 432 KiB – and buys nothing,
   because parity pads in memory when it computes the final stripe. Its on-disk size is recorded at offset 240.
+
+### Padding
+
+What the shards hold is the compressed stream followed by zeros up to its **Padmé** length:
+
+```
+padme(L) = L                                      if L < 2
+E = ⌊log₂ L⌋,  S = ⌊log₂ E⌋ + 1,  b = E − S       otherwise
+padme(L) = ⌈L / 2^b⌉ · 2^b
+```
+
+A container's size is visible to anyone who can list a bucket, and without padding it gives the compressed size of
+the backup to the byte: enough to tell which of two known trees a container holds, or to notice that one file was
+added since last month. Padmé keeps the leading bits of a length and rounds the rest away, so what remains is "about
+this large". The cost falls in steps as lengths grow: at most 12.5% below 256 bytes, 6.3% up to 64 KiB, 3.2% from
+there to 4 GiB and 1.6% above – where rounding up to a power of two would cost up to 100%.
+
+The header field at offset 56 is the padded length, because the shard layout follows from it and a header is read
+without a key. The exact length lives in the manifest, which is sealed. A reader hands on the first `streamLength`
+bytes, and still reads and authenticates the shards that hold only padding: a restore that skipped them would be a
+restore from a container nobody looked at to the end. Padding that is not zeros is refused.
+
+The manifest is padded the same way, inside its seal ([§8](#8-manifest)), since its size follows the number of files
+and the length of their names.
 
 ### Stripes
 
@@ -344,6 +484,12 @@ being worthwhile, so past that point the parity count rises instead.
 | 50 | 8 + 4 | 50.0% |
 
 A percentage too small for a 128-shard stripe to express is rounded **up**, never down.
+
+**This mapping is part of format 2.0**, not a tuning choice of the writer. The manifest records the percentage and
+the header records `k` and `p`, and a reader refuses a container in which the two do not agree under exactly this
+rule: for `p` from 2 upward, `k = round(100·p / percent)`; the first `p` with `k ≥ 8` is taken, and `k` is cut to
+`128 − p` when the stripe would be wider than 128. A writer that chose stripes any other way would produce
+containers this reader calls invalid, so a different rule is a different format version.
 
 **Shard sizing.** `shardBytes` is a maximum, not a fixed choice. A stripe cannot be narrower than one shard, so a
 payload smaller than `k` shards could never reach the requested percentage: a 3 MiB backup in 4 MiB shards is one data
@@ -378,15 +524,31 @@ The order is what makes the result trustworthy:
 3. Reconstruct on the stored ciphertext, because that is what parity covers.
 4. **Authenticate every rebuilt shard before writing it.** Reed-Solomon will happily produce bytes from bad input;
    only the tag knows whether they are the bytes that were lost.
-5. Re-open and fully verify the repaired copy before reporting success.
+5. Re-open and fully verify the repaired copy – both copies of every piece of metadata, then every shard – and
+   only then publish it.
 
 Reed-Solomon reconstructs; AEAD decides whether the reconstruction is right. Never the other way around.
+
+The repaired set is written under staging names beside its destination and moved into place by the same no-replace
+publication a backup uses, after step 5 and not before. A repair that fails or is interrupted removes what it staged,
+so a file called `backup.repaired.bond` is always a container that passed.
+
+**The read path does the same thing in memory.** A restore, or a rekey, that meets a shard which does not
+authenticate reads the rest of that stripe, authenticates every shard of it, reconstructs, and hands on the rebuilt
+shard only if it opens under its own tag. Nothing is written back; the reader counts what it rebuilt and the command
+reports it, because the container is exactly as damaged as before. What this buys is that a recovery does not begin
+with writing a second full copy of the backup.
 
 **Damage outside the payload is repaired too.** A repair starts from a byte-for-byte copy, so a header the reader had
 to take from the mirror – or a slot table it had to take from the spare – would otherwise be reproduced faithfully in
 the "repaired" file, leaving it one flip from being lost. Whichever copies authenticated are written back over both
-positions. Nothing is invented: the header carries its own MAC and the slot table is re-signed under the same header
-key, so this restores redundancy the container already proved it owns. It is also the one repair that works without
+positions, and the manifest is written back from whichever copy matched the digest in the authenticated header.
+Nothing is invented: the header carries its own MAC and the slot table is re-signed under the same header
+key, so this restores redundancy the container already proved it owns.
+
+The manifest needs saying separately because it is the copy a reader is least likely to notice. Either copy opens the
+container, so a reader that stops at the first one that works never looks at the second. Both are checked at unlock –
+the second only against the header's digest, which costs a hash – and a damaged one is a notice like any other. It is also the one repair that works without
 any recovery data at all, since it needs no parity to reconstruct anything.
 
 ## 6a. Volumes
@@ -423,6 +585,11 @@ the first. Without that last check a foreign volume passes as one of the set and
 carries and the manifest the last one adds. A file index of a million files can exceed that allowance, in which case
 the last volume is a little larger than asked for – better than refusing to finish a backup over it.
 
+Because a boundary never falls inside a shard, a shard larger than that budget would be a volume larger than the
+limit: a writer with one shard in hand and an empty volume has nowhere else to put it. The shard size is therefore
+cut to the largest multiple of 4096 that fits, a parity shard's extra tag included, before the first byte is written.
+`shardBytes` was already a maximum ([§6](#6-payload-shards-and-recovery-data)); this is one more thing it yields to.
+
 **The tail offset is a position inside the last volume**, not in the container as a whole, and every volume's header
 records the same value. A reader that insisted it point past the whole 132 KiB head – which only volume 1 has – refused
 every header copy of every volume in a set whose last file held less than 128 KiB of payload. That is an ordinary
@@ -435,7 +602,8 @@ Volumes `.002` and later move first, the destination directory is synced, and `.
 followed by another directory sync. A reported failure triggers reverse rollback where possible. A process crash can
 leave non-leading orphan volumes, which do not form a valid set and require explicit operator cleanup; BOND never
 deletes or replaces an existing backup set automatically. The refusal names every file occupying the namespace, because
-"something is in the way" is not something an operator can act on. Sidecars use exclusive creation.
+"something is in the way" is not something an operator can act on. Sidecars use exclusive creation; the one that
+belongs to the first volume is rewritten when a key change alters that file.
 
 What counts as the namespace is the same rule `VolumeFiles` uses to discover a set, not "ends in three digits":
 `backup.bond.old.001` is a volume of `backup.bond.old` and does not block `backup.bond`. The writer's own staging files
@@ -501,13 +669,33 @@ along the current recursion ancestry: a loop edge is omitted with a warning, whi
 materialized independently. With following disabled, included links are omitted, counted and reported. Filters apply
 to the link's archive path and the resolved target kind.
 
+A Windows junction, or any other reparse point that is not a symlink, is treated as a link. `Lstat` reports those as
+irregular – neither link nor directory – and read as an ordinary file a junction archives as zero bytes under a
+directory's name.
+
+What resolves to neither a file nor a directory is not archived: named pipes, sockets and device nodes are skipped
+with a warning and counted, and recognised before anything is opened, since opening a FIFO for reading blocks until
+something writes to it.
+
+A name is stored as the bytes it has, whether or not they are text. The tar stream keeps them as they are; the file
+index is JSON, which writes U+FFFD in place of a byte that is not valid UTF-8, so an index entry for such a name
+carries it a second time as `pathBytes` (base64) and a reader goes by that. A name that is valid UTF-8 has no
+`pathBytes`. Without it the index and the archive would name the entry differently, and a restore that checks one
+against the other would stop there. Restoring such a name needs a system where names are bytes, which is Linux; on
+Windows and macOS the entry is refused by name.
+
 ## 8. Manifest
 
 gzip(JSON), sealed with `manifestKey` and framed as `[LE64 length][24-byte nonce][ciphertext]`, written twice.
-Associated data is `"BOND-MANIFEST-V1" ‖ containerUUID`.
+Associated data is `T("BOND-MANIFEST-V2", containerUUID)`.
 
-It holds the compression settings, the exact stream length and its SHA-256, the shard geometry, and the **file
-index**: path, kind, size, mode, mtime and SHA-256 for every entry.
+The plaintext under the seal is `LE64(n) ‖ gzip bytes (n of them) ‖ zeros`, padded to `padme(8 + n)`. A reader checks
+that the total length is exactly that and that the padding is empty.
+
+It holds the compression settings, the exact stream length (`streamLength`), the padded one (`paddedLength`, which
+must equal the header's and `padme(streamLength)`), the stream's SHA-256, the shard geometry, and the **file
+index**: path (and `pathBytes` for a name that is not UTF-8, [§7](#7-the-archive-namespace)), kind, size, mode,
+mtime and SHA-256 for every entry.
 
 The p7e sketch deliberately kept names out of the manifest. That reasoning does not survive contact with the key
 model: the manifest is sealed with a key derived from the same master key as the payload, so a name in the manifest is
@@ -525,7 +713,7 @@ Everything here is a number the test suite produces, not a claim about the desig
 
 ### The bit-flip sweep
 
-`TestSingleBitFlipIsNeverSilent` takes a real container, flips one bit at a time across 631 offsets chosen to cover
+`TestSingleBitFlipIsNeverSilent` takes a real container, flips one bit at a time across 632 offsets chosen to cover
 every named header field densely and every other region by a fixed count, and reads the whole thing back. Each attempt
 lands in one of three outcomes: **refused**, **absorbed** (it opened and returned exactly the right bytes), or
 **silent** – it opened and returned something else. A silent result is a bug, and there is no acceptable number of them
@@ -536,11 +724,11 @@ but zero.
 | Superblock | 286 | 0 | 286 | 0 |
 | Key-slot table A | 143 | 0 | 143 | 0 |
 | Key-slot table B | 16 | 0 | 16 | 0 |
-| Payload | 80 | 80 | 0 | 0 |
+| Payload | 81 | 81 | 0 | 0 |
 | Manifest, copy 1 | 21 | 0 | 21 | 0 |
 | Manifest, copy 2 | 21 | 0 | 21 | 0 |
 | Superblock mirror | 64 | 0 | 64 | 0 |
-| **Total** | **631** | **80** | **551** | **0** |
+| **Total** | **632** | **81** | **551** | **0** |
 
 Each region is walked by a fixed count rather than by a stride running to a variable end, so those numbers are the same
 on every run. They did not use to be: the sealed manifest changes length by a byte or two from one container to the
@@ -564,7 +752,7 @@ Named cases, each its own test:
 
 | Damage | Result |
 |---|---|
-| One bit in a data shard | Located to the shard; repaired if parity covers the stripe |
+| One bit in a data shard | Located to the shard; repaired if parity covers the stripe, and rebuilt in memory by a restore |
 | A whole shard zeroed | Same |
 | `p` shards lost in one stripe | Repaired |
 | `p+1` shards lost in one stripe | Refused, and says which stripes – never guessed at |
@@ -578,7 +766,7 @@ Named cases, each its own test:
 | Both superblock copies | Refused, loudly |
 | One key-slot table | Opens from the other; `repair` writes both back |
 | Both key-slot tables | Refused |
-| One manifest copy | Opens from the other |
+| One manifest copy | Opens from the other, and is reported; `repair` writes both back |
 | One volume's header, in a split set | Opens from that volume's mirror; `repair` writes both back |
 | A truncated volume | Refused |
 | A volume from a different container | Refused at open, on the container UUID |
@@ -606,7 +794,7 @@ lines of the parser and never reaches the arithmetic, which is the only place an
 
 ### Memory
 
-The streaming pipeline's promise is that a backup of a terabyte needs a terabyte of destination and nothing else, so
+The streaming pipeline's promise is that a backup of a terabyte needs a terabyte of disk and no memory to match, so
 `TestMemoryDoesNotGrowWithThePayload` measures it: the same tree at 16 MiB and at 64 MiB, same geometry, peak Go heap
 sampled throughout.
 
@@ -635,6 +823,7 @@ own file access – and Go prefixes absolute paths with `\\?\` before calling th
 - Bit rot and range corruption: every shard is authenticated, and damage is located to the shard.
 - An encrypted container altered in transit: the header MAC, slot-table MAC, per-shard tags, manifest tag and key
   commitment all have to agree for an attacker who does not possess an unlocking secret.
+- A container substituted by someone who knows the recipient's public key, when the restore expects a writer.
 - A shard moved, duplicated or transplanted from another container.
 - A wrong passphrase: rejected before any payload is touched.
 - A half-written backup: the container is built in the working directory and renamed into place only when complete.
@@ -645,18 +834,29 @@ own file access – and Go prefixes absolute paths with `\\?\` before calling th
 - Losing every key. That is the design.
 - Malware on the machine while the backup runs, or while the passphrase is typed.
 - Deletion of the object in the cloud. Parity repairs corruption, not absence; keep two copies.
-- Traffic analysis of size and timing. The container's size is not hidden.
+- Traffic analysis of size and timing. The container's size is rounded, not hidden: Padmé padding leaves the order
+  of magnitude and the leading bits, and when a container was written is plain to whoever stores it.
 - Damage beyond the recovery capacity of a stripe. Parity repairs corruption, not deletion, and not more losses than
   it covers.
 - Malicious modification of a `NONE` container. Its key is stored in the container, so its tags provide corruption
   detection but no provenance or adversarial authenticity; use an external signature where that property is needed.
-- **Rolling the key slots back.** Someone who can write to the container can destroy the newer slot table and leave
-  the older one, which is authentic because it was. A key removed with `bond keys remove` therefore stops working for
-  anyone who has only the container; it is not proof against someone who kept a copy of the file. `bond rekey` is the
-  answer when it has to be, because it changes the master key and leaves nothing for an old slot to unwrap.
+- **Substitution of an unsigned recipient-only container.** A recipient slot needs nothing but the public key to
+  create, so whoever knows that key can build a complete, valid container the recovery key opens. Such a container
+  is confidential and cannot be *altered* without the master key, but nothing in it says who wrote it. A writer
+  signature checked with `--expect-writer` closes this ([§4](#writer-signatures)); so does restoring through a
+  passphrase or key-file slot, which cannot be made without the secret. A restore through a recipient slot with
+  neither is warned about.
+- **Replay.** An older container, authentic when it was written, can be served in place of a newer one, and a
+  deleted one looks the same as one never written. Nothing inside a single file can say it is the latest.
+- **Rolling the key slots back.** A key change replaces both slot tables, so a key removed with `bond keys remove`
+  stops working for anyone who has only the current container. It is not proof against someone who kept a copy of
+  the file from before, whose slot tables are authentic because they were. `bond rekey` is the answer when it has to
+  be, because it changes the master key and leaves nothing for an old slot to unwrap.
 
-**Leaked without a key**: the file size, the container UUID, the creation time, the shard geometry, the cipher and KDF
-parameters, and how many key slots of which kinds exist. Not the file names, not the sizes of individual files, not
+**Leaked without a key**: the file size and with it the padded length of the compressed stream, the container UUID,
+the creation time, the shard geometry, the cipher and KDF parameters, how many key slots of which kinds exist, and
+the writer fingerprint of a signed container, the label of each slot, which is stored in the clear – do not put anything in a label that the destination should
+not read. Not the file names, not the sizes of individual files, not
 the source paths.
 
 ## 11. Recovering by hand
@@ -664,29 +864,43 @@ the source paths.
 A backup format nobody can decode without its own tool is a single point of failure. This is the procedure if the
 `bond` binary is what got lost. Everything here uses documented primitives and the constants above.
 
-1. **Read the header.** Bytes 0–4095. Check the magic. Take `cipherID` (24), `shardSize` (36), `dataShardCount` (48),
-   `streamLength` (56), `containerUUID` (72, 16 bytes), `noncePrefix` (88, 16 bytes), `tailOffset` (104),
-   `tailLength` (112) and `lastShardBytes` (240). If the magic is wrong, read the last 4096 bytes instead.
+All integers are little-endian, and `T(…)` is the tuple encoding of [§4](#4-key-model): each value preceded by its
+length as a 4-byte integer.
+
+1. **Read the header.** Bytes 0–4095. Check the magic and that the version at offset 8 is 2. Take `cipherID` (24),
+   `shardSize` (36), `dataShardCount` (48), the padded stream length (56), `containerUUID` (72, 16 bytes),
+   `noncePrefix` (88, 16 bytes), `tailOffset` (104), `tailLength` (112) and `lastShardBytes` (240). If the magic is
+   wrong, read the last 4096 bytes instead.
 
 2. **Find the current key slot table.** Parse both 64 KiB tables at 4096 and 69632; take the one with the higher
    generation (offset 8) that has magic `BSLT`. Walk its records from offset 64 using each record's size field. On a
    container whose keys were never changed the two tables are identical, so either will do; if the newer one looks
    damaged, try the other.
 
-3. **Recover the master key.** For a passphrase slot, compute
-   `Argon2id(passphrase, salt, iterations, memoryKiB, lanes, 32)` with the values at offsets 48 and 64–75 of the
-   record. That is the key-encryption key. Open the 48-byte wrapped key at offset 80 with XChaCha20-Poly1305 using
-   the nonce at offset 24 and associated data
-   `"BOND-SLOT-V1" ‖ containerUUID ‖ slotUUID ‖ slotType ‖ salt ‖ LE32(memKiB) ‖ LE32(iters) ‖ LE32(lanes)`.
-   For a key file, the key-encryption key is `HKDF-SHA512(keyfileBytes, salt, "bond/v1/keyfile-kek", 32)` instead,
-   and the associated data ends after the salt – there are no KDF parameters to bind.
+3. **Recover the master key.** In a record, the slot type is at offset 6, the slot UUID at 8, the nonce at 24, the
+   salt at 48, the Argon2id parameters at 64 (memory in KiB, passes, lanes: three 4-byte integers), the key
+   commitment at 80 and the 48-byte wrapped key at 112.
 
-4. **Derive the subkeys.** `HKDF-SHA512(fmk, salt = containerUUID, info, 32)` for each of `bond/v1/data`,
-   `bond/v1/manifest`, `bond/v1/header`, `bond/v1/commit`.
+   For a passphrase slot (type 1), normalize the passphrase to Unicode NFC and compute
+   `KEK = Argon2id(passphrase, salt, passes, memoryKiB, lanes, 32)`. For a key file (type 2),
+   `KEK = HKDF-SHA512(keyfile bytes, salt, "bond/v2/keyfile-kek", 32)`.
+
+   Then `K_enc = HKDF-SHA512(KEK, no salt, "bond/v2/slot-enc", 32)` and `K_com` likewise with `"bond/v2/slot-com"`.
+   The associated data is `T("BOND-SLOT-V2", containerUUID, slotUUID, slotType as one byte, salt, params)`, where
+   `params` is the twelve parameter bytes at offset 64 for a passphrase slot and empty for a key file. If
+   `HMAC-SHA256(K_com, T(nonce, aad))` is not the commitment, this is not the slot for this secret: go on to the
+   next. Otherwise open the wrapped key with XChaCha20-Poly1305 under `K_enc`, the nonce and `aad`.
+
+4. **Derive the subkeys.** `HKDF-SHA512(fmk, salt = containerUUID, info, 32)` for each of `bond/v2/data`,
+   `bond/v2/manifest`, `bond/v2/header`, `bond/v2/commit`. To be sure of the key and the header before going on:
+   `HMAC-SHA256(headerKey, header with bytes 208–239 zeroed)` is the 32 bytes at offset 208, and
+   `HMAC-SHA256(commitKey, T("BOND-COMMIT-V2", containerUUID))` is the 32 bytes at offset 176.
 
 5. **Decrypt the payload.** Open each shard with `dataKey`, nonce `noncePrefix ‖ LE64(i)`, and associated data
-   `"BOND-DATA-V1" ‖ containerUUID ‖ LE64(i) ‖ LE32(shardSize)`. Concatenate the results and keep the first
-   `streamLength` bytes.
+   `T("BOND-DATA-V2", containerUUID, LE64(i), LE32(shardSize))`. Concatenate the results. That is the stream followed
+   by zero padding; keep the first `streamLength` bytes, where `streamLength` is the exact length in the manifest
+   (step 7) – the header only has the padded one. Without the manifest, an xz decoder stops at the end of its
+   stream and a tar reader at its end marker, so the padding does no harm.
 
    Where shard `i` begins depends on whether the container carries parity. With `parityID` 0 it is simply
    `135168 + i × shardSize`. With parity, read `k` at offset 40 and `p` at offset 44, and note that a full stripe
@@ -697,13 +911,32 @@ A backup format nobody can decode without its own tool is a single point of fail
 6. **Unpack.** The result is an xz stream (or a bare tar if the manifest says `"compression": "none"`).
    `xz -d < stream.xz | tar -xf -`. Any xz and any tar will do; there is nothing BOND-specific left at this point.
 
-7. **The manifest**, if you want it: read `tailLength` bytes at `tailOffset`, skip the 8-byte length, take the next
-   24 bytes as the nonce, open the rest with `manifestKey` and associated data `"BOND-MANIFEST-V1" ‖ containerUUID`,
-   then gunzip. If that copy is damaged, the second one starts at `tailOffset + tailLength`. In a split container
-   `tailOffset` is a position in the **last** volume, and every volume's header carries the same value.
+7. **The manifest**: read `tailLength` bytes at `tailOffset`, skip the 8-byte length, take the next 24 bytes as the
+   nonce, and open the rest with `manifestKey` and associated data `T("BOND-MANIFEST-V2", containerUUID)`. The
+   result starts with an 8-byte length `n`; the next `n` bytes are gzip, and what follows is padding. Gunzip gives
+   JSON, with `streamLength`, `streamSha256` and `compression` at the top level. If that copy is damaged, the second
+   one starts at `tailOffset + tailLength`. In a split container `tailOffset` is a position in the **last** volume,
+   and every volume's header carries the same value.
 
-Steps 1–6 are about eighty lines of Go against `golang.org/x/crypto`, and the same in Python against `cryptography`
-and `argon2-cffi`.
+8. **The writer**, if the container is signed (scheme 1 at offset 276) and you know whose key to expect: the
+   fingerprint at 280 is the SHA-256 of that public key; the message is `T("BOND-WRITER-V2", header)` with bytes
+   208–239 and 312–3684 zeroed; the first 64 signature bytes at 312 are Ed25519 over it, the remaining 3309 are
+   ML-DSA-65 with context `"BOND-WRITER-V2"`. Then SHA-256 of the volume's payload slice – from 135168 in the first
+   volume, 4096 in the others, for the length at offset 168 – is the 32 bytes at 244. This step needs no key.
+
+**This procedure exists as a program.** [tools/handread](tools/handread/main.go) is these eight steps in about five
+hundred lines of Go, written from this section and sharing no code with the rest of the repository: it imports
+nothing of BOND's, and its only dependencies are Argon2id, XChaCha20-Poly1305, Unicode normalization, Ed25519 and
+ML-DSA. Its tests
+run it against a frozen container and against containers the current writer produces, with and without recovery
+data, in one file and split. A constant that changed in the format without changing here would pass every other
+test in the repository and fail that one, which is the reason it is kept separate.
+
+```
+go run ./tools/handread -passphrase-file pass.txt -o stream.xz backup.bond
+go run ./tools/handread -keyfile usb.key backup.bond.001 backup.bond.002 | xz -d | tar -xf -
+go run ./tools/handread -expect-writer writer.key.pub -passphrase-file pass.txt -o stream.xz backup.bond
+```
 
 ## 12. Where the time goes
 
@@ -744,4 +977,7 @@ Restoring is 16× faster than backing up, which is the right way round for a too
 | 1 GiB | 1 GiB | 3 | 8 | 429 ms |
 | 2 GiB | 2 GiB | 3 | 8 | 817 ms |
 
-Parameters are stored per slot, so raising them affects new containers and leaves old ones openable.
+Parameters are stored per slot, so a container opens with whatever it was written with. This build writes every
+passphrase slot with the default profile; there is no setting for another one, and `bond bench-kdf` is a measurement
+of what that profile costs on a given machine, not a way to choose. A machine that cannot spare 512 MiB for one
+derivation cannot create or open a passphrase slot, and is better served by a key file or a recipient key.

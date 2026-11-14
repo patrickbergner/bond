@@ -47,6 +47,10 @@ type Options struct {
 	// MaxVolumeBytes splits the container into numbered files of roughly this
 	// size. Zero writes a single file.
 	MaxVolumeBytes int64
+
+	// Signer, if set, signs every volume header, so a restore that is told to
+	// expect this writer can tell its containers from anyone else's.
+	Signer *crypto.WriterPrivate
 }
 
 // Writer seals a compressed stream into a container. Write is called with the
@@ -69,6 +73,7 @@ type Writer struct {
 	closed      bool
 	unencrypted bool
 	recovery    int
+	signer      *crypto.WriterPrivate
 
 	plan        parity.Plan
 	coder       *parity.Coder
@@ -151,6 +156,7 @@ func Create(path string, opts Options) (*Writer, error) {
 		slots:       slots,
 		unencrypted: opts.Unencrypted,
 		recovery:    opts.RecoveryPercent,
+		signer:      opts.Signer,
 		sb: &format.Superblock{
 			VersionMajor:  format.VersionMajor,
 			VersionMinor:  format.VersionMinor,
@@ -206,7 +212,13 @@ func (w *Writer) Validate(path string) error {
 		return err
 	}
 	defer r.Close()
-	return r.AuthenticateWithKeys(w.keys)
+	if err := r.AuthenticateWithKeys(w.keys); err != nil {
+		return err
+	}
+	if w.signer != nil {
+		return r.checkWriterEverywhere(w.signer.Public())
+	}
+	return nil
 }
 
 // Write accepts the compressed stream and seals it into shards.
@@ -319,6 +331,19 @@ func (w *Writer) Finish(m *format.Manifest) error {
 	if w.closed {
 		return fmt.Errorf("container is already finished")
 	}
+
+	// The stream ends here; what follows it into the shards is padding. The
+	// container's size would otherwise give the compressed length of the backup
+	// to the byte, to anyone who can list a bucket. Zeros up to the Padmé length
+	// leave "about this large" and take away the rest. The exact length and the
+	// digest are of the stream itself and go into the sealed manifest; the
+	// header, which anyone can read, gets only the padded length.
+	streamLen := w.streamLen
+	streamDigest := hex.EncodeToString(w.streamHash.Sum(nil))
+	if err := w.pad(int64(format.Padme(uint64(streamLen))) - streamLen); err != nil {
+		return err
+	}
+
 	if err := w.flushShard(); err != nil {
 		return err
 	}
@@ -332,8 +357,9 @@ func (w *Writer) Finish(m *format.Manifest) error {
 
 	m.FormatVersion = format.VersionMajor
 	m.Created = w.sb.Created
-	m.StreamLength = w.streamLen
-	m.StreamSHA256 = hex.EncodeToString(w.streamHash.Sum(nil))
+	m.StreamLength = streamLen
+	m.PaddedLength = w.streamLen
+	m.StreamSHA256 = streamDigest
 	m.ShardSize = w.shardSize
 	m.DataShardCount = int64(w.shardIndex)
 	m.RecoveryPercent = w.recovery
@@ -369,10 +395,16 @@ func (w *Writer) Finish(m *format.Manifest) error {
 	// Each volume's header differs only in which slice of the payload it
 	// describes, so each is signed for itself – and each volume gets both
 	// copies of it, the leading one and the mirror that closes the file.
-	if err := w.vols.WriteMirrors(w.sb, func(sb *format.Superblock) { sb.Sign(w.keys.Header) }); err != nil {
-		return err
+	sign := func(sb *format.Superblock) error {
+		if w.signer != nil {
+			if err := sb.SignWriter(w.signer); err != nil {
+				return err
+			}
+		}
+		sb.Sign(w.keys.Header)
+		return nil
 	}
-	if err := w.vols.PatchHeaders(w.sb, func(sb *format.Superblock) { sb.Sign(w.keys.Header) }); err != nil {
+	if err := w.vols.WriteHeaders(w.sb, sign); err != nil {
 		return err
 	}
 	if err := w.writeHead(); err != nil {
@@ -384,6 +416,19 @@ func (w *Writer) Finish(m *format.Manifest) error {
 	}
 	w.closed = true
 	return w.vols.Close()
+}
+
+// pad appends n zero bytes to the stream.
+func (w *Writer) pad(n int64) error {
+	zeros := make([]byte, 64<<10)
+	for n > 0 {
+		chunk := min(n, int64(len(zeros)))
+		if _, err := w.Write(zeros[:chunk]); err != nil {
+			return err
+		}
+		n -= chunk
+	}
+	return nil
 }
 
 // writeHead lays down the key-slot tables, which live only in the first volume.

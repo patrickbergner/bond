@@ -76,6 +76,11 @@ func (w *Writer) addFile(e Entry) error {
 	if err != nil {
 		return fmt.Errorf("%s: %w", e.Path, err)
 	}
+	// The walker only hands over regular files. This is the same rule held at
+	// the point of reading, for a path that became something else in between.
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file (%s); refusing to archive it", e.Path, info.Mode().Type())
+	}
 	if e.Expected != nil && !os.SameFile(e.Expected, info) {
 		return fmt.Errorf("%s changed identity between enumeration and opening; refusing to archive a substituted path", e.Path)
 	}

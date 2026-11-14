@@ -9,16 +9,18 @@ import (
 	"github.com/patrickbergner/bond/internal/crypto"
 )
 
-// The key-slot table is written twice, at two fixed offsets, and only one of
-// the two is current. Changing a key writes the *other* one and bumps its
-// generation, so the operation is atomic without any journal: a crash halfway
-// through leaves the previous table untouched and still the highest valid
-// generation. Readers take the newest table that verifies.
+// The key-slot table is written twice, at two fixed offsets. Changing a key
+// writes the copy that is not current with the next generation, and then the
+// same bytes over the one that was, so the operation is atomic without any
+// journal: a crash before the first write lands leaves the previous table
+// untouched and still the highest valid generation, and the second write is
+// what stops the previous slot set from surviving in the file. Readers take
+// the newest table that verifies.
 //
 // This is also why the superblock does not authenticate these tables. If it
 // did, adding a key would mean rewriting the superblock in every volume of a
 // terabyte container. Instead each table carries its own MAC, and changing a
-// key touches exactly 64 KiB in the first volume.
+// key touches exactly these two tables in the first volume.
 
 const (
 	slotTableHeaderSize = 64
@@ -35,6 +37,13 @@ const (
 )
 
 var slotMagic = [4]byte{'B', 'S', 'L', 'T'}
+
+// slotTableVersion and slotRecordVersion are 2 in format 2.0: a record carries
+// a key commitment it did not have before.
+const (
+	slotTableVersion  = 2
+	slotRecordVersion = 2
+)
 
 // ErrNoSlotTable means neither table could be read.
 var ErrNoSlotTable = errors.New("this container has no readable key slots")
@@ -69,7 +78,7 @@ func (t *SlotTable) Marshal(headerKey []byte) ([]byte, error) {
 
 	b := make([]byte, SlotTableSize)
 	copy(b[offSlotMagic:], slotMagic[:])
-	binary.LittleEndian.PutUint16(b[offSlotVersion:], 1)
+	binary.LittleEndian.PutUint16(b[offSlotVersion:], slotTableVersion)
 	binary.LittleEndian.PutUint16(b[offSlotCount:], uint16(len(t.Slots)))
 	binary.LittleEndian.PutUint64(b[offSlotGeneration:], t.Generation)
 	binary.LittleEndian.PutUint32(b[offSlotUsedBytes:], uint32(records.Len()))
@@ -92,7 +101,7 @@ func ParseSlotTable(b []byte) (*SlotTable, error) {
 	if !bytes.Equal(b[offSlotMagic:offSlotMagic+4], slotMagic[:]) {
 		return nil, errors.New("key-slot table is missing its magic")
 	}
-	if v := binary.LittleEndian.Uint16(b[offSlotVersion:]); v != 1 {
+	if v := binary.LittleEndian.Uint16(b[offSlotVersion:]); v != slotTableVersion {
 		return nil, fmt.Errorf("key-slot table version %d is not supported", v)
 	}
 
@@ -156,7 +165,8 @@ const (
 	offRecKDFIter  = 68
 	offRecKDFLanes = 72
 	offRecWrapLen  = 76
-	offRecWrapped  = 80
+	offRecCommit   = 80
+	offRecWrapped  = offRecCommit + crypto.CommitmentLen
 )
 
 func marshalSlot(s *crypto.Slot) ([]byte, error) {
@@ -167,6 +177,8 @@ func marshalSlot(s *crypto.Slot) ([]byte, error) {
 		return nil, fmt.Errorf("slot nonce is %d bytes, want %d", len(s.Nonce), crypto.NonceLen)
 	case len(s.Salt) != 16:
 		return nil, fmt.Errorf("slot salt is %d bytes, want 16", len(s.Salt))
+	case len(s.Commitment) != crypto.CommitmentLen:
+		return nil, fmt.Errorf("slot key commitment is %d bytes, want %d", len(s.Commitment), crypto.CommitmentLen)
 	case len(s.Label) > maxLabelLen:
 		return nil, fmt.Errorf("slot label is %d bytes, the format allows %d", len(s.Label), maxLabelLen)
 	}
@@ -174,7 +186,7 @@ func marshalSlot(s *crypto.Slot) ([]byte, error) {
 	size := offRecWrapped + len(s.Wrapped) + 2 + len(s.Label) + 4 + len(s.Encapsulation)
 	b := make([]byte, size)
 	binary.LittleEndian.PutUint32(b[offRecSize:], uint32(size))
-	binary.LittleEndian.PutUint16(b[offRecVersion:], 1)
+	binary.LittleEndian.PutUint16(b[offRecVersion:], slotRecordVersion)
 	b[offRecType] = uint8(s.Type)
 	copy(b[offRecUUID:], s.UUID)
 	copy(b[offRecNonce:], s.Nonce)
@@ -183,6 +195,7 @@ func marshalSlot(s *crypto.Slot) ([]byte, error) {
 	binary.LittleEndian.PutUint32(b[offRecKDFIter:], s.KDF.Iterations)
 	binary.LittleEndian.PutUint32(b[offRecKDFLanes:], s.KDF.Parallelism)
 	binary.LittleEndian.PutUint32(b[offRecWrapLen:], uint32(len(s.Wrapped)))
+	copy(b[offRecCommit:], s.Commitment)
 	copy(b[offRecWrapped:], s.Wrapped)
 	binary.LittleEndian.PutUint16(b[offRecWrapped+len(s.Wrapped):], uint16(len(s.Label)))
 	copy(b[offRecWrapped+len(s.Wrapped)+2:], s.Label)
@@ -203,7 +216,7 @@ func parseSlot(b []byte) (*crypto.Slot, int, error) {
 	if size < offRecWrapped || size > len(b) {
 		return nil, 0, fmt.Errorf("record claims %d bytes, %d are available", size, len(b))
 	}
-	if v := binary.LittleEndian.Uint16(b[offRecVersion:]); v != 1 {
+	if v := binary.LittleEndian.Uint16(b[offRecVersion:]); v != slotRecordVersion {
 		return nil, 0, fmt.Errorf("record version %d is not supported", v)
 	}
 
@@ -223,11 +236,12 @@ func parseSlot(b []byte) (*crypto.Slot, int, error) {
 	}
 
 	s := &crypto.Slot{
-		Type:    crypto.SlotType(b[offRecType]),
-		UUID:    append([]byte(nil), b[offRecUUID:offRecUUID+16]...),
-		Nonce:   append([]byte(nil), b[offRecNonce:offRecNonce+crypto.NonceLen]...),
-		Salt:    append([]byte(nil), b[offRecSalt:offRecSalt+16]...),
-		Wrapped: append([]byte(nil), b[offRecWrapped:offRecWrapped+wrapLen]...),
+		Type:       crypto.SlotType(b[offRecType]),
+		UUID:       append([]byte(nil), b[offRecUUID:offRecUUID+16]...),
+		Nonce:      append([]byte(nil), b[offRecNonce:offRecNonce+crypto.NonceLen]...),
+		Salt:       append([]byte(nil), b[offRecSalt:offRecSalt+16]...),
+		Wrapped:    append([]byte(nil), b[offRecWrapped:offRecWrapped+wrapLen]...),
+		Commitment: append([]byte(nil), b[offRecCommit:offRecCommit+crypto.CommitmentLen]...),
 		KDF: crypto.KDFParams{
 			MemoryKiB:   binary.LittleEndian.Uint32(b[offRecKDFMem:]),
 			Iterations:  binary.LittleEndian.Uint32(b[offRecKDFIter:]),

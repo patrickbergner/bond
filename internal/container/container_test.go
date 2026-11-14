@@ -98,10 +98,16 @@ func TestRoundTripSizes(t *testing.T) {
 			path := build(t, payload, Options{ShardSize: shard})
 			r := openUnlocked(t, path)
 
-			if got := int64(r.Superblock().StreamLength); got != tc.size {
-				t.Errorf("stream length = %d, want %d", got, tc.size)
+			// What the shards hold is the stream padded to its Padmé length, and
+			// that is all a header says; the exact length is in the manifest.
+			padded := int64(format.Padme(uint64(tc.size)))
+			if got := int64(r.Superblock().StreamLength); got != padded {
+				t.Errorf("stream length in the header = %d, want the padded %d", got, padded)
 			}
-			wantShards := (tc.size + plainPerShard - 1) / plainPerShard
+			if got := r.Manifest().StreamLength; got != tc.size {
+				t.Errorf("stream length in the manifest = %d, want %d", got, tc.size)
+			}
+			wantShards := (padded + plainPerShard - 1) / plainPerShard
 			if got := int64(r.Superblock().DataShardCount); got != wantShards {
 				t.Errorf("shard count = %d, want %d", got, wantShards)
 			}
@@ -110,7 +116,8 @@ func TestRoundTripSizes(t *testing.T) {
 			}
 
 			// Full shards except the last, which carries only what it holds.
-			// Nothing is rounded up, so a small backup costs a small file.
+			// Nothing is rounded up to a shard, so a small backup costs a small
+			// file.
 			info, err := os.Stat(path)
 			if err != nil {
 				t.Fatal(err)
@@ -118,14 +125,14 @@ func TestRoundTripSizes(t *testing.T) {
 			sb := r.Superblock()
 			var payloadBytes int64
 			if wantShards > 0 {
-				lastPlain := tc.size - (wantShards-1)*plainPerShard
+				lastPlain := padded - (wantShards-1)*plainPerShard
 				payloadBytes = (wantShards-1)*shard + lastPlain + crypto.TagLen
 			}
 			want := int64(format.PayloadOffset) + payloadBytes + 2*int64(sb.TailLength) + format.SuperblockSize
 			if info.Size() != want {
 				t.Errorf("file is %d bytes, want %d", info.Size(), want)
 			}
-			if wantShards > 0 && int64(sb.LastShardBytes) != tc.size-(wantShards-1)*plainPerShard+crypto.TagLen {
+			if wantShards > 0 && int64(sb.LastShardBytes) != padded-(wantShards-1)*plainPerShard+crypto.TagLen {
 				t.Errorf("last shard is recorded as %d bytes", sb.LastShardBytes)
 			}
 		})
@@ -1204,5 +1211,63 @@ func TestNotAContainer(t *testing.T) {
 	}
 	if _, err := Open(path); !errors.Is(err, format.ErrNotContainer) {
 		t.Errorf("Open on random bytes gave %v, want ErrNotContainer", err)
+	}
+}
+
+// A removed key must stop opening the container the moment the removal returns.
+// Writing only the spare table left the previous slot set in the file, and a
+// reader that falls back to it kept accepting the removed key until some later
+// key change happened to overwrite that copy.
+func TestRemovedKeyStopsOpeningAtOnce(t *testing.T) {
+	keyfile := bytes.Repeat([]byte{0x42}, crypto.KeyLen)
+	path := build(t, []byte("revocation"), Options{
+		ShardSize: 8192,
+		Keys: []KeySpec{
+			{Secret: crypto.Passphrase(testPass), KDF: fastKDF, Label: "to be removed"},
+			{Secret: crypto.KeyfileSecret(keyfile), Label: "stays"},
+		},
+	})
+
+	r := openUnlocked(t, path)
+	var remaining []*crypto.Slot
+	for _, slot := range r.Slots() {
+		if slot.Type != crypto.SlotPassphrase {
+			remaining = append(remaining, slot)
+		}
+	}
+	if err := UpdateSlots(path, r.Keys(), remaining); err != nil {
+		t.Fatal(err)
+	}
+	r.Close()
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := raw[format.SlotTableAOffset : format.SlotTableAOffset+format.SlotTableSize]
+	b := raw[format.SlotTableBOffset : format.SlotTableBOffset+format.SlotTableSize]
+	if !bytes.Equal(a, b) {
+		t.Error("the two key-slot tables differ after a key change; the previous slot set is still in the file")
+	}
+
+	removed, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer removed.Close()
+	if err := removed.Unlock(crypto.Passphrase(testPass)); !errors.Is(err, crypto.ErrWrongKey) {
+		t.Fatalf("the removed passphrase: got %v, want ErrWrongKey", err)
+	}
+
+	kept, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer kept.Close()
+	if err := kept.Unlock(crypto.KeyfileSecret(keyfile)); err != nil {
+		t.Fatalf("the remaining key no longer opens the container: %v", err)
+	}
+	if notices := kept.Notices(); len(notices) != 0 {
+		t.Errorf("a key change left the container reporting damage: %v", notices)
 	}
 }

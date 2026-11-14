@@ -65,5 +65,5 @@ bond_fail verify "$CONTAINER" --quick
 expect_err "no checksum file next to"
 
 step "a container with no sidecar still verifies in full: the sidecar is a convenience, not the proof"
-bond_ok verify "$CONTAINER"
+bond_ok verify --allow-unencrypted "$CONTAINER"
 expect_out "OK"

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -86,7 +85,7 @@ options:
 }
 
 func createBackups(cfg *config.Config, targets []*config.Target, configPath, workDir string, verbose, ignoreErrors bool, keys *keyFlags) error {
-	ctx := context.Background()
+	ctx := rootCtx
 	now := time.Now()
 	base := config.BaseVars()
 
@@ -99,6 +98,7 @@ func createBackups(cfg *config.Config, targets []*config.Target, configPath, wor
 		return err
 	}
 	defer tool.Close()
+	defer keys.forget()
 
 	var (
 		totalSize  int64
@@ -130,12 +130,38 @@ func createBackups(cfg *config.Config, targets []*config.Target, configPath, wor
 			continue
 		}
 
-		specs, err := keySpecsFor(keys, settings)
+		// One interrupt ends the run, not just the target it arrived in.
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		// A key that cannot be had fails this target like anything else about
+		// it would. Another target may use a different key, or none.
+		specs, err := keySpecsFor(keys, settings, vars)
 		if err != nil {
-			return err
+			failures++
+			fmt.Printf("  ! %v\n", err)
+			continue
+		}
+
+		var signer *crypto.WriterPrivate
+		if settings.SigningKey != "" {
+			keyPath, err := config.Expand(settings.SigningKey, vars)
+			if err == nil {
+				signer, err = loadWriterKey(keyPath)
+			}
+			if err != nil {
+				wipeKeySpecs(specs.slots)
+				failures++
+				fmt.Printf("  ! signingKey: %v\n", err)
+				continue
+			}
 		}
 
 		describeSettings(settings)
+		if signer != nil {
+			fmt.Printf("  signed by     writer %s\n", shortID(signer.Fingerprint()))
+		}
 
 		progress := ui.NewProgress(os.Stderr)
 		unreadable := 0
@@ -147,11 +173,12 @@ func createBackups(cfg *config.Config, targets []*config.Target, configPath, wor
 			WorkDir:     work,
 			OutputPath:  outPath,
 			Tool:        tool,
+			Signer:      signer,
 			OnEntry: func(e archive.Entry) {
 				progress.Add(e.Size)
 				if verbose {
 					progress.Clear()
-					fmt.Printf("    %s\n", e.Path)
+					fmt.Printf("    %s\n", ui.Path(e.Path))
 				}
 			},
 			OnWarning: func(path, msg string) {
@@ -174,6 +201,7 @@ func createBackups(cfg *config.Config, targets []*config.Target, configPath, wor
 			},
 		})
 		wipeKeySpecs(specs.slots)
+		signer.Wipe()
 		progress.Clear()
 		if err != nil {
 			failures++
@@ -190,6 +218,9 @@ func createBackups(cfg *config.Config, targets []*config.Target, configPath, wor
 		// missing subtree survives until the restore that needed it.
 		if result.Stats.SkippedSymlinks > 0 {
 			fmt.Printf("  links skipped %s\n", ui.Items(result.Stats.SkippedSymlinks, "symlink", "symlinks"))
+		}
+		if result.Stats.SkippedSpecial > 0 {
+			fmt.Printf("  not archived  %s (pipes, sockets, devices)\n", ui.Items(result.Stats.SkippedSpecial, "special file", "special files"))
 		}
 		fmt.Printf("  written       %s\n", result.Path)
 		fmt.Printf("                %s", ui.Bytes(result.Size))
@@ -242,7 +273,22 @@ func wipeKeySpecs(specs []container.KeySpec) {
 	wipeUnlockers(unlockers)
 }
 
-func keySpecsFor(keys *keyFlags, settings config.Resolved) (*keySpecs, error) {
+func keySpecsFor(keys *keyFlags, settings config.Resolved, vars config.Vars) (*keySpecs, error) {
+	// Key-slot paths take the same placeholders as outputPath and workPath. The
+	// loader has always accepted them there, and the sample control file uses
+	// {{HOME}} for one; they were then handed to the filesystem unexpanded.
+	slotList := append([]config.KeySlot(nil), settings.KeySlots...)
+	for i := range slotList {
+		if slotList[i].Path == "" {
+			continue
+		}
+		expanded, err := config.Expand(slotList[i].Path, vars)
+		if err != nil {
+			return nil, fmt.Errorf("keySlots[%d]: path: %w", i, err)
+		}
+		slotList[i].Path = expanded
+	}
+	settings.KeySlots = slotList
 	slots, unencrypted, err := keys.createSpecs(settings, crypto.DefaultKDF)
 	if err != nil {
 		return nil, err
@@ -341,6 +387,9 @@ func dryRunBackup(cfg *config.Config, targets []*config.Target, configPath, work
 		if stats.SkippedSymlinks > 0 {
 			fmt.Printf("  links skipped %s\n", ui.Items(stats.SkippedSymlinks, "symlink", "symlinks"))
 		}
+		if stats.SkippedSpecial > 0 {
+			fmt.Printf("  not archived  %s (pipes, sockets, devices)\n", ui.Items(stats.SkippedSpecial, "special file", "special files"))
+		}
 		if stats.ExcludedFiles > 0 || stats.ExcludedDirs > 0 {
 			fmt.Printf("  filtered out  %s, %s\n",
 				ui.Items(stats.ExcludedFiles, "file", "files"),
@@ -348,7 +397,7 @@ func dryRunBackup(cfg *config.Config, targets []*config.Target, configPath, work
 		}
 
 		vars := base.ForTarget(target.ID, now)
-		out, err := containerPath(settings, vars, workDir)
+		out, err := containerPath(settings, vars, "")
 		if err != nil {
 			problems++
 			fmt.Printf("  ! %v\n", err)

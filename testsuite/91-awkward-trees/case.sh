@@ -27,21 +27,21 @@ round_trip() {
     config_write "$cfg"
     bond_ok backup --config "$cfg"
     CONTAINER="$(container_in "$out")"
-    bond_ok verify "$CONTAINER"
-    bond_ok restore "$CONTAINER" --to "$CASE_TMP/restored-$1"
+    bond_ok verify --allow-unencrypted "$CONTAINER"
+    bond_ok restore --allow-unencrypted "$CONTAINER" --to "$CASE_TMP/restored-$1"
     RESTORED="$CASE_TMP/restored-$1/awkward"
 }
 
 step "stored without compression, every awkward entry comes back exactly as it went in"
 round_trip stored 0
 assert_trees_equal "$src" "$RESTORED"
-bond_ok inspect "$CONTAINER"
+bond_ok inspect --allow-unencrypted "$CONTAINER"
 expect_out "compression       none"
 
 step "compressed hard, the same tree comes back the same way"
 round_trip squeezed 9
 assert_trees_equal "$src" "$RESTORED"
-bond_ok inspect "$CONTAINER"
+bond_ok inspect --allow-unencrypted "$CONTAINER"
 expect_out "compression       xz, level 9"
 
 step "compression is not just a flag: the compressed container is the smaller of the two"
@@ -57,18 +57,18 @@ step "the empty directory survived, which is the entry most often dropped"
     fail "something was restored into the empty directory"
 
 step "names with umlauts and spaces are listed as they are spelled"
-bond_ok list "$CONTAINER"
+bond_ok list --allow-unencrypted "$CONTAINER"
 expect_out "awkward/Grüße/Kapitel 1.txt"
 expect_out "awkward/ünïcödé and spaces.json"
 
 step "a subtree can be restored on its own, and nothing outside it comes with it"
-bond_ok restore "$CONTAINER" --to "$CASE_TMP/restored-part" --include "awkward/notes"
+bond_ok restore --allow-unencrypted "$CONTAINER" --to "$CASE_TMP/restored-part" --include "awkward/notes"
 assert_exists "$CASE_TMP/restored-part/awkward/notes"
 assert_missing "$CASE_TMP/restored-part/awkward/photos"
 assert_missing "$CASE_TMP/restored-part/awkward/empty.txt"
 
 step "a prefix that matches nothing restores nothing, rather than everything"
-bond_ok restore "$CONTAINER" --to "$CASE_TMP/restored-none" --include "awkward/nothing-by-that-name"
+bond_ok restore --allow-unencrypted "$CONTAINER" --to "$CASE_TMP/restored-none" --include "awkward/nothing-by-that-name"
 [ -z "$(find "$CASE_TMP/restored-none" -type f 2>/dev/null)" ] ||
     fail "an --include prefix that matches nothing restored files anyway"
 

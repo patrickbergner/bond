@@ -28,7 +28,12 @@ container="$(container_in "$out")"
 step "0 means it worked"
 bond_ok version
 bond_ok help
-bond_ok list "$container"
+bond_ok list --allow-unencrypted "$container"
+expect_err "opened with the key stored in the container"
+
+step "an unencrypted container is refused until the operator says it is expected"
+bond_fail list "$container"
+expect_err "--allow-unencrypted"
 
 step "2 means the command was wrong: no command at all, or one that does not exist"
 bond_usage
@@ -89,7 +94,7 @@ for command in backup restore list verify repair inspect keygen keys rekey; do
 done
 
 step "reporting goes to stdout, so a container's contents can be piped into something else"
-bond_ok list "$container"
+bond_ok list --allow-unencrypted "$container"
 [ "$BOND_OUT" = "$(printf 'data\ndata/file.txt')" ] ||
     fail "the listing was not the two lines expected, but: $BOND_OUT"
 
@@ -101,21 +106,21 @@ bond_fail verify "$CASE_TMP/no-such-container.bond"
 # Argument order
 
 step "options may come after the positional argument, because that is how people type it"
-bond_ok restore "$container" --to "$CASE_TMP/restored-after"
+bond_ok restore --allow-unencrypted "$container" --to "$CASE_TMP/restored-after"
 assert_exists "$CASE_TMP/restored-after/data/file.txt"
 
 step "and before it, because that is how the usage line reads"
-bond_ok restore --to "$CASE_TMP/restored-before" "$container"
+bond_ok restore --allow-unencrypted --to "$CASE_TMP/restored-before" "$container"
 assert_exists "$CASE_TMP/restored-before/data/file.txt"
 
 step "and interleaved, because parsing should not be a puzzle"
-bond_ok restore --to "$CASE_TMP/restored-between" "$container" --verbose
+bond_ok restore --allow-unencrypted --to "$CASE_TMP/restored-between" "$container" --verbose
 expect_out "data/file.txt"
 
 step "-- ends the options, so a container whose name begins with a dash is still openable"
 dashed="$CASE_TMP/-dashed.bond"
 cp "$container" "$dashed"
-bond_ok list -- "$dashed"
+bond_ok list --allow-unencrypted -- "$dashed"
 expect_out "data/file.txt"
 
 step "the short forms mean what the long forms mean"
@@ -124,9 +129,9 @@ expect_out "nothing was written; this was a dry run"
 bond_ok backup --config "$cfg" --dry-run
 expect_out "nothing was written; this was a dry run"
 bond_ok backup -c "$cfg" -t vault -n
-bond_ok list "$container" -l
+bond_ok list --allow-unencrypted "$container" -l
 expect_out "data/file.txt"
-bond_ok list "$container" --long
+bond_ok list --allow-unencrypted "$container" --long
 expect_out "data/file.txt"
 
 step "-v and --version are the version, wherever else -v means verbose"

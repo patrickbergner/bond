@@ -23,7 +23,7 @@ jobs:
 
       # internal/sevenzip/bin/ is gitignored, so a fresh checkout cannot even
       # compile: the go:embed of a per-platform 7-Zip is a build error, not a
-      # skipped test. The fetch pulls ~6.5 MB from www.7-zip.org; caching it
+      # skipped test. The fetch pulls ~6.5 MB from 7-Zip's GitHub releases; caching it
       # keeps every push off a third-party host. Nothing installs unless it
       # hashes to the value pinned in tools/manifest.json, so a poisoned cache
       # fails the fetch rather than ending up inside the binary – and bumping
@@ -38,7 +38,7 @@ jobs:
           key: sevenzip-${{ hashFiles('tools/manifest.json') }}
 
       # build.sh runs this too, where it verifies rather than downloads. Doing
-      # it here first means a 7-zip.org outage is its own red step instead of
+      # it here first means a download outage is its own red step instead of
       # something to find inside the build log.
       - name: Fetch the embedded binaries
         run: go run ./tools/fetch

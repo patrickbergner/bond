@@ -2,6 +2,7 @@ package container
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"math/rand"
@@ -318,7 +319,7 @@ func TestSmuggledPaddingIsCaughtAndScrubbed(t *testing.T) {
 		t.Fatal(err)
 	}
 	fixed := filepath.Join(t.TempDir(), "fixed.bond")
-	if _, err := Repair(r, fixed, report, nil); err != nil {
+	if _, err := Repair(context.Background(), r, fixed, report, nil); err != nil {
 		t.Fatalf("Repair refused a container that opened on its spare copy: %v", err)
 	}
 	r.Close()
@@ -391,7 +392,7 @@ func TestADamagedHeaderCopyIsAlwaysReported(t *testing.T) {
 				t.Fatal(err)
 			}
 			fixed := filepath.Join(t.TempDir(), "fixed.bond")
-			if _, err := Repair(r, fixed, report, nil); err != nil {
+			if _, err := Repair(context.Background(), r, fixed, report, nil); err != nil {
 				t.Fatalf("Repair left the container on its last copy: %v", err)
 			}
 
@@ -448,7 +449,7 @@ func TestRepairRestoresTheSpareCopies(t *testing.T) {
 	}
 
 	fixed := filepath.Join(t.TempDir(), "fixed.bond")
-	result, err := Repair(r, fixed, report, nil)
+	result, err := Repair(context.Background(), r, fixed, report, nil)
 	if err != nil {
 		t.Fatalf("Repair: %v", err)
 	}

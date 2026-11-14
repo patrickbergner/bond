@@ -28,10 +28,16 @@ func runVerify(args []string) error {
 Checks a container for damage. Every shard is authenticated and the compressed
 stream is re-hashed against what the manifest recorded.
 
+Exits 1 unless the container is fully healthy. That includes a payload that
+is whole in a container that has lost one of its two copies of a header, a
+key-slot table or the manifest: "bond repair" puts the copy back.
+
 options:
       --quick   check only the checksum file next to the container.
                 Needs no key, so it is the check to run right after an upload
-                or a download.
+                or a download. With --expect-writer it checks the writer's
+                signature and every volume's signed payload digest instead,
+                which a substituted container cannot pass.
 %s
 `, keyFlagHelp)
 	}
@@ -45,6 +51,9 @@ options:
 	path := operands[0]
 
 	if quick {
+		if keys.expectWriter != "" {
+			return signedQuickVerify(path, keys.expectWriter)
+		}
 		return quickVerify(path)
 	}
 
@@ -60,7 +69,7 @@ options:
 	fmt.Printf("  shards      %s of %s\n", ui.Count(int(sb.DataShardCount)), ui.Bytes(int64(sb.ShardSize)))
 	fmt.Printf("  recovery    %s\n", sb.Plan())
 	for _, notice := range r.Notices() {
-		fmt.Printf("  repaired    %s\n", notice)
+		fmt.Printf("  damaged     %s\n", notice)
 	}
 
 	progress := ui.NewProgress(os.Stderr)
@@ -97,6 +106,16 @@ options:
 	}
 
 	fmt.Printf("  checked     %s in %s\n", ui.Bytes(int64(sb.PayloadBytes())), time.Since(started).Round(time.Millisecond))
+
+	// A container that opened on its last copy of something has not passed. The
+	// payload is whole, but the next flip in that region is the one that loses
+	// it, and a scheduled check that exits 0 here is a check nobody hears from
+	// until then.
+	if len(r.Notices()) > 0 {
+		fmt.Printf("  payload     every shard authenticates and the stream matches its digest\n")
+		fmt.Printf("  repairable  yes – run: bond repair %s\n", path)
+		return fmt.Errorf("the payload is intact, but the container has lost a copy of its metadata and is one more fault from being unreadable")
+	}
 	fmt.Printf("  OK          every shard authenticates and the stream matches its digest\n")
 	return nil
 }
@@ -125,6 +144,40 @@ func quickVerify(path string) error {
 		}
 		fmt.Printf("  %-24s %s matches its %s checksum file\n", name, ui.Bytes(fileSize(p)), algorithm)
 	}
+	return nil
+}
+
+// signedQuickVerify checks a container against its writer's public key, and
+// against the checksum files when they are there. It needs no decryption key.
+func signedQuickVerify(path, expect string) error {
+	pub, err := loadWriterPublic(expect)
+	if err != nil {
+		return badUsage("--expect-writer: %v", err)
+	}
+	rep, err := container.VerifySigned(path, pub)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%s\n", path)
+	fmt.Printf("  writer      %s – every volume header is signed by it\n", shortID(pub.Fingerprint()))
+	for _, notice := range rep.Notices {
+		fmt.Printf("  damaged     %s\n", notice)
+	}
+	var total int64
+	for _, p := range rep.Paths {
+		total += fileSize(p)
+		if backup.SidecarAlgorithm(p) != "" {
+			if _, err := backup.CheckSidecar(p); err != nil {
+				return err
+			}
+		}
+	}
+	fmt.Printf("  payload     %s in %s matches what the writer signed\n", ui.Bytes(total), ui.Items(len(rep.Paths), "file", "files"))
+	if len(rep.Notices) > 0 {
+		fmt.Printf("  repairable  yes – run: bond repair %s\n", path)
+		return fmt.Errorf("the container is what its writer signed, but has lost a copy of its metadata")
+	}
+	fmt.Printf("  OK          signed by the expected writer and unchanged since\n")
 	return nil
 }
 
@@ -176,10 +229,15 @@ options:
 	fmt.Printf("  payload           %s\n", ui.Bytes(int64(sb.PayloadBytes())))
 	fmt.Printf("  recovery data     %s\n", sb.Plan())
 	fmt.Printf("  volumes           %s\n", ui.Items(r.Volumes(), "file", "files"))
+	if id := r.Signer(); id != nil {
+		fmt.Printf("  signed by         writer %s (Ed25519 + ML-DSA-65; check with --expect-writer)\n", shortID(id))
+	} else {
+		fmt.Printf("  signed by         nobody\n")
+	}
 
 	fmt.Printf("  key slots         %d\n", len(r.Slots()))
 	for _, s := range r.Slots() {
-		label := s.Label
+		label := s.DisplayLabel()
 		if label != "" {
 			label = "  " + label
 		}
@@ -220,8 +278,15 @@ options:
 	if keys.allowExpensiveKDF {
 		fmt.Fprintln(os.Stderr, "warning: --allow-expensive-kdf permits unauthenticated container data to request extreme memory or CPU")
 	}
-	if err := r.UnlockWithOptions(keys.unlockOptions(), secrets...); err != nil {
+	opts, err := keys.unlockOptions()
+	if err != nil {
 		return err
+	}
+	if err := r.UnlockWithOptions(opts, secrets...); err != nil {
+		return err
+	}
+	if r.WriterChecked() {
+		fmt.Printf("  writer            %s – the signature verifies\n", shortID(r.Signer()))
 	}
 
 	m := r.Manifest()

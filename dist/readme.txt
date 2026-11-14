@@ -58,12 +58,13 @@ COMMANDS
   bond list    backup.bond -l         what is inside, from the manifest
   bond inspect backup.bond            format and settings
   bond restore backup.bond --to ./restored
-  bond bench-kdf                      how hard can this machine hash a
-                                      passphrase
+  bond bench-kdf                      what the passphrase hardening costs
+                                      on this machine
 
   bond keygen --recovery-card card.txt    a printable key, and a public key
                                           for the control file
   bond keygen --keyfile usb.key           32 bytes for a device you plug in
+  bond keygen --signing-key writer.key    signs what this machine writes
   bond keys list  backup.bond             what can open this container
   bond keys add   backup.bond --new-passphrase
   bond keys rotate-passphrase backup.bond
@@ -85,11 +86,22 @@ Four ways into a container, and any number of them at once:
   key file          the file at both ends
   recovery card     nothing but a public key to back up; the printed key to
                     restore
-  none              no confidentiality, integrity only
+  none              no confidentiality, integrity only; opens with
+                    --allow-unencrypted and never without it
 
 All of them wrap the same master key, so adding, removing or rotating one
-writes 64 KiB - the same work on a one-terabyte backup as on a one-megabyte
+writes 128 KiB - the same work on a one-terabyte backup as on a one-megabyte
 one. Only "bond rekey" re-encrypts anything, and it says so before it starts.
+A removed or rotated key stops opening the container at once, but still
+opens a copy of the file made earlier; "bond rekey" is what changes that.
+
+A public key can lock a backup and never open one, but it cannot vouch for
+one either: anyone who has it can write a container the recovery card opens.
+A writer key closes that: put "signingKey" in the control file, keep the .pub
+file beside the card, and restore with --expect-writer writer.key.pub. A
+container the writer did not sign is then refused. "bond verify --quick
+--expect-writer writer.key.pub" checks a stored container with no key that
+could open it.
 
 The recovery card is the interesting one. "bond keygen --recovery-card"
 writes a printable key and a public key; only the public key goes in the
@@ -145,8 +157,14 @@ RECOVERY DATA AND VOLUMES
 recoveryPercent adds Reed-Solomon parity so a container survives the
 corruption storage quietly inflicts on it. "bond verify" locates the damage
 and says whether it can be rebuilt; "bond repair" rebuilds it into a NEW
-file, leaving the damaged one untouched, and re-verifies the result before
-reporting success.
+file, leaving the damaged one untouched, and verifies the result in full
+before giving it its name.
+
+"bond restore" uses the recovery data too: a shard that fails while being
+read is rebuilt in memory, and the summary says the container is damaged.
+"bond verify" exits non-zero for anything short of full health, including a
+container that opened on its last copy of a header, a key-slot table or the
+manifest; "bond repair" puts that copy back.
 
 The capacity is per stripe, not per container. At 10% a stripe is 20 data
 shards protected by 2 parity shards, so any two losses out of twenty are
@@ -160,7 +178,8 @@ maxVolumeBytes splits a container into numbered files, for object stores that
 cap a single upload. Each volume carries its own header - twice, once at each
 end of the file - and its own checksum file, so any one of them finds the
 rest: "bond restore backup.bond.003" works as well as starting from the
-first, and "bond verify --quick" checks every volume of the set.
+first, and "bond verify --quick" checks every volume of the set. Shards are
+cut to fit, so no volume is larger than maxVolumeBytes.
 
 
 THE RESTORE DRILL

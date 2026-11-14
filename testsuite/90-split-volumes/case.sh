@@ -53,16 +53,16 @@ bond_ok verify "$BASE" --quick
 [ "$(out_lines)" -ge "$volumes" ] || fail "the quick check did not report on every volume"
 
 step "the set verifies and restores in full"
-bond_ok verify "$BASE"
+bond_ok verify --allow-unencrypted "$BASE"
 expect_out "OK"
-bond_ok restore "$BASE" --to "$CASE_TMP/restored-base"
+bond_ok restore --allow-unencrypted "$BASE" --to "$CASE_TMP/restored-base"
 assert_trees_equal "$src" "$CASE_TMP/restored-base/data"
 
 step "the set opens when named by any of its volumes, not only the first"
-bond_ok restore "$BASE.003" --to "$CASE_TMP/restored-third"
+bond_ok restore --allow-unencrypted "$BASE.003" --to "$CASE_TMP/restored-third"
 assert_trees_equal "$src" "$CASE_TMP/restored-third/data"
-bond_ok list "$BASE.002"
-bond_ok inspect "$BASE.004"
+bond_ok list --allow-unencrypted "$BASE.002"
+bond_ok inspect --allow-unencrypted "$BASE.004"
 expect_out "volumes"
 
 step "the whole set can be moved and renamed, because a container is a file and not a registration"
@@ -74,7 +74,7 @@ while IFS= read -r v; do
     cp "$v.sha384" "$moved/$(printf 'archive-2026.bond.%03d.sha384' "$i")"
     i=$(( i + 1 ))
 done < <(volumes_of "$BASE")
-bond_ok restore "$moved/archive-2026.bond" --to "$CASE_TMP/restored-moved"
+bond_ok restore --allow-unencrypted "$moved/archive-2026.bond" --to "$CASE_TMP/restored-moved"
 assert_trees_equal "$src" "$CASE_TMP/restored-moved/data"
 
 # ---------------------------------------------------------------------------
@@ -84,21 +84,21 @@ step "a missing volume is refused, and the message names the one that is missing
 gone="$CASE_TMP/gone"
 cp -r "$moved" "$gone"
 rm -f "$gone/archive-2026.bond.003" "$gone/archive-2026.bond.003.sha384"
-bond_fail restore "$gone/archive-2026.bond" --to "$CASE_TMP/restored-gone"
+bond_fail restore --allow-unencrypted "$gone/archive-2026.bond" --to "$CASE_TMP/restored-gone"
 expect_err "003"
 
 step "a truncated volume is refused: a short file is never a complete volume"
 short="$CASE_TMP/short"
 cp -r "$moved" "$short"
 truncate_by "$short/archive-2026.bond.002" 100000
-bond_fail restore "$short/archive-2026.bond" --to "$CASE_TMP/restored-short"
+bond_fail restore --allow-unencrypted "$short/archive-2026.bond" --to "$CASE_TMP/restored-short"
 
 step "a volume from a different container is refused, on the identity in its header"
 write_set other "$CASE_TMP/output-other"
 mixed="$CASE_TMP/mixed"
 cp -r "$moved" "$mixed"
 cp "$(volumes_of "$BASE" | sed -n 2p)" "$mixed/archive-2026.bond.002"
-bond_fail restore "$mixed/archive-2026.bond" --to "$CASE_TMP/restored-mixed"
+bond_fail restore --allow-unencrypted "$mixed/archive-2026.bond" --to "$CASE_TMP/restored-mixed"
 
 # ---------------------------------------------------------------------------
 # Damage inside the set, with the checksum files still beside it – the path
@@ -109,7 +109,7 @@ damaged="$CASE_TMP/damaged"
 cp -r "$moved" "$damaged"
 middle="$damaged/archive-2026.bond.003"
 poke_payload "$middle" 200000 1024
-bond_fail verify "$damaged/archive-2026.bond"
+bond_fail verify --allow-unencrypted "$damaged/archive-2026.bond"
 expect_out "repairable  yes – run: bond repair"
 
 step "the quick check names which volume of the set is the bad one"
@@ -118,7 +118,7 @@ expect_err "archive-2026.bond.003"
 
 step "repair rebuilds the set into a new one, leaving every original volume alone"
 cp -r "$damaged" "$CASE_TMP/damaged-as-found"
-bond_ok repair "$damaged/archive-2026.bond"
+bond_ok repair --allow-unencrypted "$damaged/archive-2026.bond"
 expect_out "rebuilt"
 expect_out "verified      every shard authenticates"
 while IFS= read -r v; do
@@ -140,20 +140,21 @@ done < <(volumes_of "$repaired")
 bond_ok verify "$repaired" --quick
 
 step "the repaired set verifies and gives back the original tree"
-bond_ok verify "$repaired"
+bond_ok verify --allow-unencrypted "$repaired"
 expect_out "OK"
-bond_ok restore "$repaired" --to "$CASE_TMP/restored-repaired"
+bond_ok restore --allow-unencrypted "$repaired" --to "$CASE_TMP/restored-repaired"
 assert_trees_equal "$src" "$CASE_TMP/restored-repaired/data"
 
 step "a damaged header in one volume is survived by that volume's own mirror"
 hdr="$CASE_TMP/header"
 cp -r "$moved" "$hdr"
 damage_header "$hdr/archive-2026.bond.004"
-bond_ok verify "$hdr/archive-2026.bond"
+bond_ok list --allow-unencrypted "$hdr/archive-2026.bond"
+bond_fail verify --allow-unencrypted "$hdr/archive-2026.bond"
 expect_out "archive-2026.bond.004"
-expect_out "OK"
-bond_ok repair "$hdr/archive-2026.bond"
-bond_ok verify "$hdr/archive-2026.repaired.bond"
+expect_out "repairable  yes – run: bond repair"
+bond_ok repair --allow-unencrypted "$hdr/archive-2026.bond"
+bond_ok verify --allow-unencrypted "$hdr/archive-2026.repaired.bond"
 expect_no_out "is damaged"
 
 # ---------------------------------------------------------------------------
@@ -216,18 +217,18 @@ done
 [ "$(count_volumes "$sliver_base")" -ge 3 ] ||
     fail "the sliver set has only $(count_volumes "$sliver_base") volumes"
 bond_ok verify "$sliver_base" --quick
-bond_ok verify "$sliver_base"
+bond_ok verify --allow-unencrypted "$sliver_base"
 expect_out "OK"
-bond_ok restore "$sliver_base" --to "$CASE_TMP/restored-sliver"
+bond_ok restore --allow-unencrypted "$sliver_base" --to "$CASE_TMP/restored-sliver"
 assert_trees_equal "$sliver_src" "$CASE_TMP/restored-sliver/sliver-data"
 
 step "and a sliver-tailed set repairs like any other"
 poke_payload "$(volumes_of "$sliver_base" | sed -n 2p)" 150000 512
-bond_fail verify "$sliver_base"
+bond_fail verify --allow-unencrypted "$sliver_base"
 expect_out "repairable  yes"
-bond_ok repair "$sliver_base"
+bond_ok repair --allow-unencrypted "$sliver_base"
 sliver_repaired="$(dirname "$sliver_base")/$(basename "${sliver_base%.bond}").repaired.bond"
-bond_ok verify "$sliver_repaired"
+bond_ok verify --allow-unencrypted "$sliver_repaired"
 expect_out "OK"
-bond_ok restore "$sliver_repaired" --to "$CASE_TMP/restored-sliver-repaired"
+bond_ok restore --allow-unencrypted "$sliver_repaired" --to "$CASE_TMP/restored-sliver-repaired"
 assert_trees_equal "$sliver_src" "$CASE_TMP/restored-sliver-repaired/sliver-data"

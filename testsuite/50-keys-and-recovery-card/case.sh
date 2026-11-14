@@ -30,8 +30,12 @@ step "a recovery card carries a printable key and the public key that locks the 
 bond_ok keygen --recovery-card "$keys/card.txt" --label "the safe at home"
 assert_exists "$keys/card.txt"
 assert_exists "$keys/card.txt.pub"
-expect_out "BOND RECOVERY KEY"
-expect_out "the safe at home"
+# The card is the one secret of the design, so it is shown on a terminal and
+# nowhere else: this run has no terminal, and its output must not carry the key.
+expect_out "not shown: output is not a terminal"
+expect_no_out "BOND-R1-"
+grep -q 'BOND RECOVERY KEY' "$keys/card.txt" || fail "the card file has no heading"
+grep -q 'the safe at home' "$keys/card.txt" || fail "the card file does not carry its label"
 grep -q '^  BOND-R1-' "$keys/card.txt" || fail "the card has no recovery key line on it"
 grep -q '"type": "recipient"' "$keys/card.txt.pub" || fail "the .pub file is not a control-file snippet"
 
@@ -95,6 +99,9 @@ step "the card in the safe opens it, typed in as it is written"
 bond_ok restore "$container" --to "$CASE_TMP/restored-card" --recovery-key "$recovery_key"
 assert_trees_equal "$src" "$CASE_TMP/restored-card/data"
 
+step "a container opened with nothing but a recovery card says that nothing proves who wrote it"
+expect_err "the container is not signed"
+
 step "case and hyphens do not matter when typing the key back"
 lowered=$(printf '%s' "$recovery_key" | tr 'A-Z' 'a-z')
 bond_ok restore "$container" --to "$CASE_TMP/restored-lower" --recovery-key "$lowered"
@@ -118,3 +125,53 @@ step "the slots are listed without any key at all, so an operator can see what t
 bond_ok keys list "$container"
 expect_out "recipient"
 expect_out "the safe at home"
+
+# ---------------------------------------------------------------------------
+# A recipient slot is made from the public key alone, so everything above would
+# open just as well a container built by anyone who knows that key. A writer key
+# is what tells the two apart: the machine signs what it writes, and a restore
+# that is told which writer to expect refuses everything else.
+
+step "a writer key signs what the machine writes, and opens nothing"
+bond_ok keygen --signing-key "$keys/writer.key"
+assert_exists "$keys/writer.key"
+assert_exists "$keys/writer.key.pub"
+out_signed="$CASE_TMP/output-signed"
+config_new "$out_signed" "$work"
+config_setting '"encryptionMethod": "RECIPIENT"'
+config_setting "\"keySlots\": [ { \"type\": \"recipient\", \"publicKey\": $(json_string "$public_key") } ]"
+config_setting "\"signingKey\": $(json_string "$keys/writer.key")"
+config_target signed "$src"
+config_write "$cfg"
+bond_ok backup --config "$cfg"
+expect_out "signed by     writer"
+signed="$(container_in "$out_signed")"
+
+step "a restore told which writer to expect checks it, and says so"
+bond_ok restore "$signed" --to "$CASE_TMP/restored-signed" --recovery-key "$recovery_key" --expect-writer "$keys/writer.key.pub"
+expect_err "signed by the expected writer"
+assert_trees_equal "$src" "$CASE_TMP/restored-signed/data"
+
+step "with nothing but the writer's public key, the stored container is proved unchanged"
+bond_ok verify "$signed" --quick --expect-writer "$keys/writer.key.pub"
+expect_out "OK"
+
+step "a container built from the card's public key alone is refused, and nothing is restored from it"
+bond_fail restore "$container" --to "$CASE_TMP/restored-forged" --recovery-key "$recovery_key" --expect-writer "$keys/writer.key.pub"
+expect_err "not signed"
+assert_missing "$CASE_TMP/restored-forged"
+bond_fail verify "$container" --quick --expect-writer "$keys/writer.key.pub"
+expect_err "not signed"
+
+step "so is one signed by some other writer"
+bond_ok keygen --signing-key "$keys/impostor.key"
+out_impostor="$CASE_TMP/output-impostor"
+config_new "$out_impostor" "$work"
+config_setting '"encryptionMethod": "RECIPIENT"'
+config_setting "\"keySlots\": [ { \"type\": \"recipient\", \"publicKey\": $(json_string "$public_key") } ]"
+config_setting "\"signingKey\": $(json_string "$keys/impostor.key")"
+config_target impostor "$src"
+config_write "$cfg"
+bond_ok backup --config "$cfg"
+bond_fail restore "$(container_in "$out_impostor")" --to "$CASE_TMP/restored-impostor" --recovery-key "$recovery_key" --expect-writer "$keys/writer.key.pub"
+expect_err "not by the expected"

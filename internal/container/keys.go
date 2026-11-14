@@ -16,14 +16,17 @@ import (
 // UpdateSlots replaces a container's key slots.
 //
 // This is the operation the whole format was shaped around. The two key-slot
-// tables sit at fixed offsets and alternate: the new set is written into
-// whichever one is not current, with the next generation number, and that is
-// the entire write. 64 KiB, wherever the container is a terabyte or a
-// megabyte, and the payload is not read, moved or rewritten.
+// tables sit at fixed offsets: the new set is written into whichever one is
+// not current, with the next generation number, and then over the one that
+// was. That is the entire write – two tables of 64 KiB, whether the container
+// is a terabyte or a megabyte – and the payload is not read, moved or
+// rewritten.
 //
 // It is also atomic without a journal. Until the new table lands, the old one
-// is still the highest valid generation; if the write is interrupted, the
-// container opens exactly as it did before.
+// is still the highest valid generation; if the write is interrupted there,
+// the container opens exactly as it did before. Interrupted between the two
+// writes it opens with the new keys, and with the previous ones until the
+// command is run again.
 func UpdateSlots(path string, keys *crypto.Keys, slots []*crypto.Slot) error {
 	if len(slots) == 0 {
 		return fmt.Errorf("a container must keep at least one key slot, or nothing can ever open it again")
@@ -86,10 +89,10 @@ func UpdateSlots(path string, keys *crypto.Keys, slots []*crypto.Slot) error {
 		return fmt.Errorf("key-slot generation has reached its maximum value")
 	}
 
-	// Write into the other one.
-	target := int64(format.SlotTableAOffset)
+	// The other one first, then the one that was current.
+	peer, previous := int64(format.SlotTableAOffset), int64(format.SlotTableBOffset)
 	if current.index == 0 {
-		target = format.SlotTableBOffset
+		peer, previous = previous, peer
 	}
 
 	next := &format.SlotTable{Generation: current.table.Generation + 1, Slots: slots}
@@ -97,22 +100,39 @@ func UpdateSlots(path string, keys *crypto.Keys, slots []*crypto.Slot) error {
 	if err != nil {
 		return err
 	}
-	if _, err := f.WriteAt(encoded, target); err != nil {
+	if err := writeSlotTable(f, keys, encoded, peer, next.Generation); err != nil {
+		return err
+	}
+	// The previous table is replaced only now, with the new one durable and
+	// read back: at every instant one authentic table exists. Leaving it would
+	// keep the old slot set in the file, where a reader falls back to it – a
+	// removed or rotated key would go on opening the container.
+	if err := writeSlotTable(f, keys, encoded, previous, next.Generation); err != nil {
+		return fmt.Errorf("the new key slots are in place, but the previous table could not be replaced, "+
+			"so the previous keys still open this container; run the command again: %w", err)
+	}
+	return nil
+}
+
+// writeSlotTable writes one table, makes it durable and proves it by reading it
+// back.
+func writeSlotTable(f *os.File, keys *crypto.Keys, encoded []byte, at int64, generation uint64) error {
+	if _, err := f.WriteAt(encoded, at); err != nil {
 		return err
 	}
 	if err := f.Sync(); err != nil {
 		return err
 	}
 	written := make([]byte, format.SlotTableSize)
-	if _, err := f.ReadAt(written, target); err != nil {
+	if _, err := f.ReadAt(written, at); err != nil {
 		return fmt.Errorf("reading back the updated key slots: %w", err)
 	}
 	checked, err := format.ParseSlotTable(written)
 	if err != nil {
 		return fmt.Errorf("the updated key slots cannot be parsed: %w", err)
 	}
-	if checked.Generation != next.Generation {
-		return fmt.Errorf("the updated key-slot generation is %d, want %d", checked.Generation, next.Generation)
+	if checked.Generation != generation {
+		return fmt.Errorf("the updated key-slot generation is %d, want %d", checked.Generation, generation)
 	}
 	if err := checked.Verify(keys.Header); err != nil {
 		return fmt.Errorf("the updated key slots fail authentication: %w", err)

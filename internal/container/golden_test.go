@@ -11,11 +11,11 @@ import (
 	"github.com/patrickbergner/bond/internal/crypto"
 )
 
-func TestImmutableFormatV1GoldenContainer(t *testing.T) {
+func TestImmutableFormatV2GoldenContainer(t *testing.T) {
 	const (
-		path       = "testdata/v1-golden.bond"
-		wantHash   = "8b8adec670fcbc01207515d51dec7354a420ac0fe6908c4efc001961731c1d07"
-		passphrase = "bond-v1-fixture-passphrase"
+		path       = "testdata/v2-golden.bond"
+		wantHash   = "2d16b133d11e02f0172708801059d7529535ec858a05761bf553043616bd2305"
+		passphrase = "bond-v2-fixture-passphrase"
 	)
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -36,8 +36,11 @@ func TestImmutableFormatV1GoldenContainer(t *testing.T) {
 	if err := r.Unlock(secret); err != nil {
 		t.Fatalf("fixture no longer unlocks: %v", err)
 	}
-	if m := r.Manifest(); m.FormatVersion != 1 || !m.IndexStored || m.Files != 1 || m.Dirs != 1 || m.Bytes != 38 {
+	if m := r.Manifest(); m.FormatVersion != 2 || !m.IndexStored || m.Files != 2 || m.Dirs != 1 || m.Bytes != 40038 {
 		t.Fatalf("unexpected fixture manifest: %+v", m)
+	}
+	if n := r.Notices(); len(n) != 0 {
+		t.Fatalf("the fixture reports damage: %v", n)
 	}
 
 	stream, err := r.Stream()
@@ -57,10 +60,41 @@ func TestImmutableFormatV1GoldenContainer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := string(content), "BOND format 1.0 compatibility fixture\n"; got != want {
+	if got, want := string(content), "BOND format 2.0 compatibility fixture\n"; got != want {
 		t.Fatalf("fixture content = %q, want %q", got, want)
+	}
+	hdr, err = tr.Next()
+	if err != nil || hdr.Name != "fixture/pattern.bin" || hdr.Size != 40000 {
+		t.Fatalf("third archive entry = %+v, %v", hdr, err)
+	}
+	pattern, err := io.ReadAll(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, b := range pattern {
+		if want := byte(i) ^ byte(i>>8) ^ byte(i>>16); b != want {
+			t.Fatalf("pattern.bin byte %d = %#x, want %#x", i, b, want)
+		}
 	}
 	if _, err := tr.Next(); err != io.EOF {
 		t.Fatalf("archive has trailing entry/data: %v", err)
+	}
+
+	// The key file opens it as well, and the whole container verifies.
+	again, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer again.Close()
+	keyfile := make([]byte, crypto.KeyLen)
+	for i := range keyfile {
+		keyfile[i] = 0x30 + byte(i)
+	}
+	if err := again.Unlock(crypto.KeyfileSecret(keyfile)); err != nil {
+		t.Fatalf("fixture no longer unlocks with its key file: %v", err)
+	}
+	report, err := again.Verify(nil)
+	if err != nil || !report.Healthy() {
+		t.Fatalf("fixture does not verify: %+v, %v", report, err)
 	}
 }

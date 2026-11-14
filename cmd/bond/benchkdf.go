@@ -24,7 +24,10 @@ func runBenchKDF(args []string) error {
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `usage: bond bench-kdf [options]
 
-Times Argon2id on this machine and suggests parameters.
+Times Argon2id on this machine at several cost profiles.
+
+BOND writes every passphrase slot with the default profile; this shows what
+that costs here, and what a stronger one would. It does not change a setting.
 
 options:
       --target <duration>   how long one unlock should take (default 1s)
@@ -72,13 +75,15 @@ options:
 
 	fmt.Println()
 	if best == nil {
-		fmt.Printf("Nothing came in under %s. The low-memory profile is the floor;\n", target)
-		fmt.Printf("BOND will not go below it, because a fast unlock is a fast guess.\n")
+		fmt.Printf("Nothing came in under %s. BOND writes passphrase slots with the default\n", target)
+		fmt.Printf("profile regardless; on this machine a key file or a recipient key may suit better.\n")
 		return nil
 	}
 	fmt.Printf("The strongest profile that fits: %s memory, %d passes, %d lanes.\n",
 		ui.Bytes(int64(best.MemoryKiB)*1024), best.Iterations, best.Parallelism)
-	fmt.Printf("Containers record their own parameters, so raising these affects new backups only.\n")
+	fmt.Printf("This is a measurement, not a setting: BOND writes every passphrase slot with the\n")
+	fmt.Printf("default profile (%s memory, %d passes, %d lanes).\n",
+		ui.Bytes(int64(crypto.DefaultKDF.MemoryKiB)*1024), crypto.DefaultKDF.Iterations, crypto.DefaultKDF.Parallelism)
 	return nil
 }
 

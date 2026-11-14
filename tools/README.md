@@ -1,4 +1,12 @@
-# Tool fetcher
+# Tools
+
+| | |
+|---|---|
+| [fetch/](fetch/) | downloads and pins the binaries BOND embeds; the rest of this page |
+| [handread/](handread/) | decrypts a container without BOND, from NERDME §11; imports nothing of BOND's, and is tested against it |
+| [fixtures/](fixtures/) | writes candidate golden fixtures and known-answer vectors for a format revision |
+
+## Tool fetcher
 
 Everything BOND embeds but does not write itself lives here: the pinned manifest, the fetcher that acts on it, and
 the licence texts that come back with the downloads.

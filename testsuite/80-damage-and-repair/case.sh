@@ -37,7 +37,7 @@ fresh_copy() {
 
 step "an undamaged container has nothing to repair, and says so without writing a file"
 fresh_copy healthy
-bond_ok repair "$SUBJECT"
+bond_ok repair --allow-unencrypted "$SUBJECT"
 expect_out "nothing to do – this container is not damaged"
 assert_missing "$CASE_TMP/subject-healthy.repaired.bond"
 
@@ -46,10 +46,16 @@ assert_missing "$CASE_TMP/subject-healthy.repaired.bond"
 step "damage inside the payload is found, located, and reported as repairable"
 fresh_copy small
 poke_payload "$SUBJECT" 300000 512
-bond_fail verify "$SUBJECT"
+bond_fail verify --allow-unencrypted "$SUBJECT"
 expect_out "damaged"
 expect_out "repairable  yes – run: bond repair"
 expect_err "the container is damaged but can be rebuilt from its recovery data"
+
+step "a restore still gives every file back: the recovery data is used while reading, and says so"
+bond_ok restore --allow-unencrypted "$SUBJECT" --to "$CASE_TMP/restored-damaged"
+expect_out "rebuilt from the recovery data"
+expect_out "bond repair"
+assert_trees_equal "$src" "$CASE_TMP/restored-damaged/data"
 
 step "the quick check catches it too, without needing a key"
 bond_fail verify "$SUBJECT" --quick
@@ -57,7 +63,7 @@ expect_err "does not match"
 
 step "repair writes a new file and does not touch the damaged one"
 cp "$SUBJECT" "$CASE_TMP/subject-small-as-found.bond"
-bond_ok repair "$SUBJECT"
+bond_ok repair --allow-unencrypted "$SUBJECT"
 repaired="$CASE_TMP/subject-small.repaired.bond"
 assert_exists "$repaired"
 expect_out "rebuilt"
@@ -71,36 +77,36 @@ assert_exists "$repaired.sha384"
 bond_ok verify "$repaired" --quick
 
 step "the repaired copy verifies in full and gives back the original tree"
-bond_ok verify "$repaired"
+bond_ok verify --allow-unencrypted "$repaired"
 expect_out "OK"
-bond_ok restore "$repaired" --to "$CASE_TMP/restored-repaired"
+bond_ok restore --allow-unencrypted "$repaired" --to "$CASE_TMP/restored-repaired"
 assert_trees_equal "$src" "$CASE_TMP/restored-repaired/data"
 
 step "repair will not write over something that is already there"
-bond_fail repair "$SUBJECT"
+bond_fail repair --allow-unencrypted "$SUBJECT"
 expect_err "already exists; name a different destination with --out"
 
 step "--out puts it where you say"
-bond_ok repair "$SUBJECT" --out "$CASE_TMP/elsewhere.bond"
+bond_ok repair --allow-unencrypted "$SUBJECT" --out "$CASE_TMP/elsewhere.bond"
 assert_exists "$CASE_TMP/elsewhere.bond"
-bond_ok verify "$CASE_TMP/elsewhere.bond"
+bond_ok verify --allow-unencrypted "$CASE_TMP/elsewhere.bond"
 
 # ---------------------------------------------------------------------------
 
 step "damage beyond what the recovery data covers is refused rather than guessed at"
 fresh_copy huge
 wreck_span "$SUBJECT" 20 70
-bond_fail verify "$SUBJECT"
+bond_fail verify --allow-unencrypted "$SUBJECT"
 expect_out "repairable  no"
 expect_err "the damage is beyond what this container's recovery data covers"
 
 step "repair refuses it too, and writes nothing"
-bond_fail repair "$SUBJECT"
+bond_fail repair --allow-unencrypted "$SUBJECT"
 expect_err "cannot be repaired from the recovery data in the container"
 assert_missing "$CASE_TMP/subject-huge.repaired.bond"
 
 step "a restore from it is refused, and nothing it did write is quietly wrong"
-bond_fail restore "$SUBJECT" --to "$CASE_TMP/restored-huge"
+bond_fail restore --allow-unencrypted "$SUBJECT" --to "$CASE_TMP/restored-huge"
 expect_no_out "match the digests recorded at backup time"
 # A restore is a stream, so a refusal partway through can leave files on disk.
 # What must never happen is a file that looks finished and holds the wrong
@@ -124,19 +130,25 @@ fi
 step "a damaged header at the front is survived: the mirror at the end carries it"
 fresh_copy header
 damage_header "$SUBJECT"
-bond_ok verify "$SUBJECT"
+bond_ok list --allow-unencrypted "$SUBJECT"
+
+step "verify does not call that healthy: the payload is whole, and the check still fails"
+bond_fail verify --allow-unencrypted "$SUBJECT"
 expect_out "the header at the front is damaged; the mirror at the end was used"
-expect_out "OK"
+expect_out "payload     every shard authenticates"
+expect_out "repairable  yes – run: bond repair"
+expect_no_out "  OK  "
+expect_err "has lost a copy of its metadata"
 
 step "repair puts the header back, and says which region it rewrote"
-bond_ok repair "$SUBJECT"
+bond_ok repair --allow-unencrypted "$SUBJECT"
 expect_out "rewritten"
-bond_ok verify "$CASE_TMP/subject-header.repaired.bond"
+bond_ok verify --allow-unencrypted "$CASE_TMP/subject-header.repaired.bond"
 expect_out "OK"
 expect_no_out "the header at the front is damaged"
 
 step "a container whose header was healed still gives back the same files"
-bond_ok restore "$CASE_TMP/subject-header.repaired.bond" --to "$CASE_TMP/restored-header"
+bond_ok restore --allow-unencrypted "$CASE_TMP/subject-header.repaired.bond" --to "$CASE_TMP/restored-header"
 assert_trees_equal "$src" "$CASE_TMP/restored-header/data"
 
 # ---------------------------------------------------------------------------
@@ -147,15 +159,15 @@ step "bytes written into the header's reserved padding are not smuggled past the
 # the container – which is a notice, not a silent success.
 fresh_copy reserved
 damage_reserved "$SUBJECT"
-bond_ok verify "$SUBJECT"
+bond_fail verify --allow-unencrypted "$SUBJECT"
 expect_out "the header at the front is damaged; the mirror at the end was used"
 
 step "repair scrubs the padding rather than leaving the passenger on board"
-bond_ok repair "$SUBJECT"
+bond_ok repair --allow-unencrypted "$SUBJECT"
 scrubbed="$CASE_TMP/subject-reserved.repaired.bond"
-bond_ok verify "$scrubbed"
+bond_ok verify --allow-unencrypted "$scrubbed"
 expect_no_out "is damaged"
-head -c 4096 "$scrubbed" | tail -c +249 | tr -d '\000' >"$CASE_TMP/.padding"
+head -c 4096 "$scrubbed" | tail -c +3686 | tr -d '\000' >"$CASE_TMP/.padding"
 [ ! -s "$CASE_TMP/.padding" ] ||
     fail "the repaired header still carries $(file_bytes "$CASE_TMP/.padding") non-zero bytes in its reserved region"
 
@@ -164,15 +176,37 @@ head -c 4096 "$scrubbed" | tail -c +249 | tr -d '\000' >"$CASE_TMP/.padding"
 step "a damaged key-slot table is survived by its spare, and repair puts it back"
 fresh_copy slots
 damage_slot_table "$SUBJECT"
-bond_ok verify "$SUBJECT"
+bond_fail verify --allow-unencrypted "$SUBJECT"
 expect_out "key-slot table"
-bond_ok repair "$SUBJECT"
-bond_ok verify "$CASE_TMP/subject-slots.repaired.bond"
+bond_ok repair --allow-unencrypted "$SUBJECT"
+bond_ok verify --allow-unencrypted "$CASE_TMP/subject-slots.repaired.bond"
 expect_no_out "key-slot table"
 expect_out "OK"
+
+step "a damaged manifest copy is reported although the other one opened, and repair puts it back"
+# The manifest is stored twice, directly before the mirrored header that closes
+# the file. The second copy is the one nobody needs to read, which is exactly
+# why its loss has to be said out loud.
+fresh_copy manifest
+poke "$SUBJECT" $(( $(file_bytes "$SUBJECT") - 4096 - 64 )) 8
+bond_fail verify --allow-unencrypted "$SUBJECT"
+expect_out "the second copy of the manifest is damaged"
+bond_ok repair --allow-unencrypted "$SUBJECT"
+expect_out "both copies of the manifest"
+bond_ok verify --allow-unencrypted "$CASE_TMP/subject-manifest.repaired.bond"
+expect_no_out "is damaged"
+expect_out "OK"
+
+step "repair refuses a destination whose checksum name is taken, and leaves nothing behind"
+fresh_copy occupied
+damage_header "$SUBJECT"
+: >"$CASE_TMP/subject-occupied.repaired.bond.sha384"
+bond_fail repair --allow-unencrypted "$SUBJECT"
+assert_missing "$CASE_TMP/subject-occupied.repaired.bond"
+assert_missing "$CASE_TMP/subject-occupied.repaired.bond.partial"
 
 step "a truncated container is refused: a short file is never a complete backup"
 fresh_copy short
 truncate_by "$SUBJECT" 200000
-bond_fail verify "$SUBJECT"
-bond_fail restore "$SUBJECT" --to "$CASE_TMP/restored-short"
+bond_fail verify --allow-unencrypted "$SUBJECT"
+bond_fail restore --allow-unencrypted "$SUBJECT" --to "$CASE_TMP/restored-short"
