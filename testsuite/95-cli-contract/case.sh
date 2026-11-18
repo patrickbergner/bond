@@ -143,13 +143,70 @@ expect_out "bond "
 # ---------------------------------------------------------------------------
 # Finding the control file
 
-step "with no --config, bond uses config.json in the working directory"
+step "with no --config, bond uses bond.config.json in the working directory"
 here="$CASE_TMP/working-directory"
 mkdir -p "$here"
 config_new "$here/output" "$work"
 config_setting '"encryptionMethod": "NONE"'
 config_target found "$src"
-config_write "$here/config.json"
+config_write "$here/bond.config.json"
 ( cd "$here" && "$BOND" backup ) >"$CASE_TMP/.found-out" 2>"$CASE_TMP/.found-err" ||
-    fail "a backup with config.json in the working directory did not run: $(cat "$CASE_TMP/.found-err")"
+    fail "a backup with bond.config.json in the working directory did not run: $(cat "$CASE_TMP/.found-err")"
 container_for "$here/output" found >/dev/null
+
+step "a BOND control file named config.json in the working directory is refused"
+stray="$CASE_TMP/stray-directory"
+mkdir -p "$stray"
+config_new "$stray/output" "$work"
+config_setting '"encryptionMethod": "NONE"'
+config_target stray "$src"
+config_write "$stray/config.json"
+cd "$stray"
+bond_usage backup
+cd - >/dev/null
+expect_err "bond.config.json"
+[ ! -e "$stray/output" ] || fail "the refused backup still wrote into $stray/output"
+
+# An installed binary has no directory of its own to keep a control file in, so
+# the user's config directory is searched last. os.UserConfigDir reads a
+# different variable on each platform; only the bond process sees the change.
+step "with no --config, bond uses config.json in the user's config directory"
+user_root="$CASE_TMP/user-config"
+case "$(uname -s)" in
+    Darwin) user_var=HOME user_dir="$user_root/Library/Application Support/bond" ;;
+    MINGW* | MSYS* | CYGWIN*) user_var=APPDATA user_dir="$user_root/bond" ;;
+    *) user_var=XDG_CONFIG_HOME user_dir="$user_root/bond" ;;
+esac
+nowhere="$CASE_TMP/no-control-file-here"
+mkdir -p "$nowhere"
+config_new "$user_dir/output" "$work"
+config_setting '"encryptionMethod": "NONE"'
+config_target user "$src"
+config_write "$user_dir/config.json"
+( cd "$nowhere" && env "$user_var=$user_root" "$BOND" backup ) >"$CASE_TMP/.user-out" 2>"$CASE_TMP/.user-err" ||
+    fail "a backup with config.json in the user's config directory did not run: $(cat "$CASE_TMP/.user-err")"
+container_for "$user_dir/output" user >/dev/null
+
+step "{{CONFIG_DIR}} is the directory holding the control file"
+placed="$CASE_TMP/placed"
+config_new '{{CONFIG_DIR}}/output' '{{CONFIG_DIR}}/work'
+config_setting '"encryptionMethod": "NONE"'
+config_target placed "$src"
+config_write "$placed/anywhere.json"
+bond_ok backup --config "$placed/anywhere.json"
+container_for "$placed/output" placed >/dev/null
+
+# The defaults for outputPath and workPath sit beside the binary – usually the
+# repository root. With the control file elsewhere they are refused, before a
+# single file is written.
+step "a control file away from the binary that leaves outputPath and workPath out is refused"
+defaults="$CASE_TMP/defaults/bond.config.json"
+mkdir -p "$(dirname "$defaults")"
+printf '{ "settings": { "encryptionMethod": "NONE" }, "targets": [ { "id": "defaulted", "sources": [ { "path": %s } ] } ] }\n' \
+    "$(json_string "$src")" >"$defaults"
+bond_fail backup --config "$defaults"
+expect_err "outputPath"
+expect_err '{{CONFIG_DIR}}/output'
+tool_dir="$(dirname "$BOND")"
+[ -z "$(find "$tool_dir/output" "$tool_dir/work" -name 'defaulted-*' 2>/dev/null)" ] ||
+    fail "the refused backup still wrote beside the binary"

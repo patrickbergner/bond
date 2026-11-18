@@ -1,5 +1,5 @@
 {
-    "$schema": "https://github.com/patrickbergner/bond/schema/bond-config.schema.json",
+    "$schema": "https://raw.githubusercontent.com/patrickbergner/bond/main/schema/bond-config.schema.json",
     "targets": [
         {
             "id": "documents-windows",
@@ -70,7 +70,7 @@
         ],
         "recoveryPercent": 10,
         "hashAlgorithm": "SHA384",
-        "outputPath": "{{TOOL_DIR}}/output",
-        "workPath": "{{TOOL_DIR}}/work"
+        "outputPath": "{{CONFIG_DIR}}/output",
+        "workPath": "{{CONFIG_DIR}}/work"
     }
 }

@@ -11,11 +11,12 @@ import (
 
 // Path variables usable in outputPath, workPath and key-slot paths.
 const (
-	VarToolDir   = "TOOL_DIR"  // directory holding the bond executable
-	VarHome      = "HOME"      // the user's home directory
-	VarTargetID  = "TARGET_ID" // id of the target being backed up
-	VarDate      = "DATE"      // 2006-01-02
-	VarTimestamp = "TIMESTAMP" // 20060102-150405
+	VarToolDir   = "TOOL_DIR"   // directory holding the bond executable
+	VarConfigDir = "CONFIG_DIR" // directory holding the control file
+	VarHome      = "HOME"       // the user's home directory
+	VarTargetID  = "TARGET_ID"  // id of the target being backed up
+	VarDate      = "DATE"       // 2006-01-02
+	VarTimestamp = "TIMESTAMP"  // 20060102-150405
 )
 
 // DateLayout and TimestampLayout are the formats behind {{DATE}} and
@@ -25,22 +26,33 @@ const (
 	TimestampLayout = "20060102-150405"
 )
 
-var knownVars = []string{VarToolDir, VarHome, VarTargetID, VarDate, VarTimestamp}
+var knownVars = []string{VarToolDir, VarConfigDir, VarHome, VarTargetID, VarDate, VarTimestamp}
 
 // Vars are the values substituted into {{NAME}} placeholders.
 type Vars map[string]string
 
-// BaseVars resolves the variables that are the same for every target in a run.
-// Missing values are left out rather than guessed, so expanding a path that
+// BaseVars resolves the variables that are the same for every target in a run,
+// controlFile being the path of the control file read, or "" when there is none
+// yet. Missing values are left out rather than guessed, so expanding a path that
 // needs one reports a clear error instead of silently producing a wrong
 // directory.
-func BaseVars() Vars {
+//
+// TOOL_DIR follows symlinks to the real binary, so a link on the PATH does not
+// move the portable layout. CONFIG_DIR deliberately does not: a control file
+// linked in from a dotfiles repository should put its output where the operator
+// sees the file, not inside that repository.
+func BaseVars(controlFile string) Vars {
 	v := Vars{}
 	if exe, err := os.Executable(); err == nil {
 		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
 			exe = resolved
 		}
 		v[VarToolDir] = filepath.Dir(exe)
+	}
+	if controlFile != "" {
+		if abs, err := filepath.Abs(controlFile); err == nil {
+			v[VarConfigDir] = filepath.Dir(abs)
+		}
 	}
 	if home, err := os.UserHomeDir(); err == nil {
 		v[VarHome] = home

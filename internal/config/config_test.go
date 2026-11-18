@@ -1,6 +1,7 @@
 package config
 
 import (
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -216,10 +217,11 @@ func ids(ts []*Target) []string {
 
 func TestExpand(t *testing.T) {
 	at := time.Date(2026, 8, 18, 21, 30, 5, 0, time.UTC)
-	vars := Vars{VarToolDir: "/opt/bond", VarHome: "/home/p"}.ForTarget("photos", at)
+	vars := Vars{VarToolDir: "/opt/bond", VarConfigDir: "/home/p/.config/bond", VarHome: "/home/p"}.ForTarget("photos", at)
 
 	cases := []struct{ in, want string }{
 		{"{{TOOL_DIR}}/output", "/opt/bond/output"},
+		{"{{CONFIG_DIR}}/work", "/home/p/.config/bond/work"},
 		{"{{HOME}}/keys/{{TARGET_ID}}.key", "/home/p/keys/photos.key"},
 		{"{{TARGET_ID}}-{{TIMESTAMP}}.bond", "photos-20260818-213005.bond"},
 		{"backup on {{DATE}}", "backup on 2026-08-18"},
@@ -244,6 +246,37 @@ func TestExpand(t *testing.T) {
 	}
 	if _, err := Expand("{{TARGET_ID}}", Vars{}); err == nil {
 		t.Error("Expand succeeded with no value for the placeholder, want an error")
+	}
+}
+
+// CONFIG_DIR is absolute even for a control file named relative to the working
+// directory, and missing rather than guessed when there is no control file.
+func TestBaseVarsConfigDir(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	got := BaseVars(filepath.Join("sub", "bond.config.json"))[VarConfigDir]
+	if want := filepath.Join(dir, "sub"); got != want {
+		t.Errorf("CONFIG_DIR = %q, want %q", got, want)
+	}
+	if v, ok := BaseVars("")[VarConfigDir]; ok {
+		t.Errorf("CONFIG_DIR = %q with no control file, want it left out", v)
+	}
+}
+
+func TestIsControlFile(t *testing.T) {
+	for _, tc := range []struct {
+		name, data string
+		want       bool
+	}{
+		{"valid", minimal, true},
+		{"broken but declaring the schema", `{"$schema": "https://example.org/bond-config.schema.json", "targets": 1}`, true},
+		{"another project's", `{"name": "web", "port": 8080}`, false},
+		{"another schema", `{"$schema": "https://json.schemastore.org/package.json", "targets": 1}`, false},
+		{"not JSON", `port = 8080`, false},
+	} {
+		if got := IsControlFile([]byte(tc.data)); got != tc.want {
+			t.Errorf("%s: IsControlFile = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }
 

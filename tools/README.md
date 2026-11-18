@@ -12,9 +12,16 @@ Everything BOND embeds but does not write itself lives here: the pinned manifest
 the licence texts that come back with the downloads.
 
 ```
-go run ./tools/fetch          # fetch what is missing
-go run ./tools/fetch --check  # verify what is here, download nothing
+go run ./tools/fetch                       # fetch what is missing
+go run ./tools/fetch --check               # verify what is here, download nothing
+go run ./tools/fetch --target linux/amd64  # only what a build for one platform embeds
 ```
+
+`build.sh` cross-compiles every platform and so fetches everything. `--target` is for a build on and for a single
+platform, such as a distribution package: it downloads only the packages that platform's binaries come from, and
+`--check` with it verifies only those. A download already in `download-cache/` under its URL's file name is used
+when it hashes to the manifest's value, so a packager can supply the files and the fetcher goes online for nothing.
+`--target` cannot be combined with `--update-hashes`, which has to see every platform.
 
 | | |
 |---|---|

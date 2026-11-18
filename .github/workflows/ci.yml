@@ -81,3 +81,58 @@ jobs:
           if-no-files-found: error
           compression-level: 0 # the payload is already-compressed archives
           retention-days: 7
+
+  # How a distribution builds BOND – the AUR's bond package, for one: on the
+  # machine it is for, with only that platform's 7-Zip, which the packager
+  # downloads and places in tools/download-cache before the fetcher runs. The
+  # build job never takes this path, so without this one a change could break
+  # it unnoticed until a user's package build failed.
+  distribution-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      # Only the downloads, under a key of their own: the build job's cache also
+      # holds every installed binary, which would leave nothing to prove here.
+      - name: Cache the 7-Zip downloads
+        uses: actions/cache@v6
+        with:
+          path: tools/download-cache
+          key: sevenzip-downloads-${{ hashFiles('tools/manifest.json') }}
+
+      - name: Fetch for this platform only
+        run: |
+          go run ./tools/fetch --target linux/amd64
+          installed="$(ls internal/sevenzip/bin)"
+          if [ "$installed" != "7zz-linux-amd64" ]; then
+            echo "error: --target linux/amd64 installed more than its own binary:" >&2
+            echo "$installed" >&2
+            exit 1
+          fi
+
+      # The flags of the AUR PKGBUILD: Arch's Go packaging guidelines want a
+      # PIE linked by the system linker, which the release's static cross
+      # builds never exercise.
+      - name: Build as a distribution does
+        env:
+          GOFLAGS: -mod=readonly -buildmode=pie -trimpath
+        run: |
+          version="$(tr -d '[:space:]' <VERSION)"
+          go build -ldflags "-linkmode=external -X main.Version=$version" -o bond ./cmd/bond
+          reported="$(./bond version)"
+          if [ "$reported" != "bond $version" ]; then
+            echo "error: the binary reports '$reported', expected 'bond $version'" >&2
+            exit 1
+          fi
+
+      # What the package's check() runs: the tests with only this platform's
+      # 7-Zip in place, and the embedded one unpacked and round-tripped.
+      - name: Test as a distribution does
+        run: |
+          go test ./...
+          ./bond selftest

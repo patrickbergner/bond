@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/patrickbergner/bond/schema/bond-config.schema.json",
+  "$id": "https://raw.githubusercontent.com/patrickbergner/bond/main/schema/bond-config.schema.json",
   "title": "BOND control file",
   "description": "Targets to back up and the settings that govern how each container is built.",
   "type": "object",
@@ -157,7 +157,7 @@
           "type": "string",
           "minLength": 1,
           "default": "{{TOOL_DIR}}/output",
-          "description": "Where finished containers are placed."
+          "description": "Where finished containers are placed. The default, beside the binary, is used only when the control file is there too; a backup that needs it otherwise is refused."
         },
         "signingKey": {
           "type": "string",
@@ -168,7 +168,7 @@
           "type": "string",
           "minLength": 1,
           "default": "{{TOOL_DIR}}/work",
-          "description": "Where containers are assembled before being renamed into outputPath."
+          "description": "Where containers are assembled before being renamed into outputPath. The default, beside the binary, is used only when the control file is there too; a backup that needs it otherwise is refused."
         }
       }
     },

@@ -12,10 +12,15 @@
 // entry in the manifest with its own version, its own destination directory and
 // its own packages.
 //
-//	go run ./tools/fetch                  # fetch whatever is missing or stale
-//	go run ./tools/fetch --check          # verify only, no downloads
-//	go run ./tools/fetch --force          # re-download everything
-//	go run ./tools/fetch --update-hashes  # re-record hashes after a version bump
+//	go run ./tools/fetch                       # fetch whatever is missing or stale
+//	go run ./tools/fetch --check               # verify only, no downloads
+//	go run ./tools/fetch --force               # re-download everything
+//	go run ./tools/fetch --update-hashes       # re-record hashes after a version bump
+//	go run ./tools/fetch --target linux/amd64  # only what a build for one platform embeds
+//
+// --target is for building on and for a single platform, as a distribution
+// package does: it downloads only the packages that platform's binaries come
+// from. A release build cross-compiles all five and fetches without it.
 package main
 
 import (
@@ -85,20 +90,28 @@ func main() {
 		force    bool
 		update   bool
 		rootPath string
+		target   string
 	)
 	flag.BoolVar(&check, "check", false, "verify the installed binaries and exit without downloading")
 	flag.BoolVar(&force, "force", false, "download again even when the cache is valid")
 	flag.BoolVar(&update, "update-hashes", false, "record the hashes actually seen, for a version bump")
 	flag.StringVar(&rootPath, "root", "", "repository root (default: the directory holding go.mod)")
+	flag.StringVar(&target, "target", "", "only the binaries for this goos/goarch, e.g. linux/amd64 (default: every platform)")
 	flag.Parse()
 
-	if err := run(rootPath, check, force, update); err != nil {
+	if err := run(rootPath, target, check, force, update); err != nil {
 		fmt.Fprintf(os.Stderr, "fetch: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(rootPath string, check, force, update bool) error {
+func run(rootPath, target string, check, force, update bool) error {
+	// --update-hashes writes the manifest back, and a narrowed one would lose
+	// every other platform's pins.
+	if target != "" && update {
+		return errors.New("--target and --update-hashes cannot be combined: re-pinning has to see every platform")
+	}
+
 	root, err := findRoot(rootPath)
 	if err != nil {
 		return err
@@ -108,6 +121,11 @@ func run(rootPath string, check, force, update bool) error {
 	if err != nil {
 		return err
 	}
+	if target != "" {
+		if m, err = m.only(target); err != nil {
+			return err
+		}
+	}
 
 	if check {
 		return verifyInstalled(root, m)
@@ -116,7 +134,7 @@ func run(rootPath string, check, force, update bool) error {
 		if err := verifyInstalled(root, m); err == nil {
 			for _, name := range toolNames(m) {
 				t := m.Tools[name]
-				fmt.Printf("%s %s: all %d binaries present and verified\n", name, t.Version, len(t.Binaries))
+				fmt.Printf("%s %s: %s present and verified\n", name, t.Version, binaries(len(t.Binaries)))
 			}
 			return nil
 		}
@@ -190,8 +208,16 @@ func (f *fetcher) fetchTool(name string, t *tool) error {
 		}
 	}
 
-	fmt.Printf("%s %s: %d binaries installed in %s\n", name, t.Version, len(t.Binaries), t.BinDir)
+	fmt.Printf("%s %s: %s installed in %s\n", name, t.Version, binaries(len(t.Binaries)), t.BinDir)
 	return nil
+}
+
+// binaries counts n binaries in words, since --target makes one a common case.
+func binaries(n int) string {
+	if n == 1 {
+		return "1 binary"
+	}
+	return fmt.Sprintf("all %d binaries", n)
 }
 
 // needsInstalledTool reports whether opening this package may require a binary
@@ -518,6 +544,37 @@ func loadManifest(path string) (*manifest, error) {
 		return nil, fmt.Errorf("%s: no tools listed", path)
 	}
 	return &m, nil
+}
+
+// only narrows the manifest to what a build for one goos/goarch embeds: each
+// tool's binaries for that target and the packages they come from. A tool with
+// no binary for the target is an error rather than left out, because the build
+// would then fail at its go:embed with a far less helpful message.
+func (m *manifest) only(target string) (*manifest, error) {
+	out := &manifest{Tools: make(map[string]*tool, len(m.Tools))}
+	for _, name := range toolNames(m) {
+		t := m.Tools[name]
+		narrowed := &tool{Version: t.Version, BinDir: t.BinDir, Packages: map[string]*pkg{}}
+		var targets []string
+		for _, b := range t.Binaries {
+			targets = append(targets, b.Target)
+			if b.Target != target {
+				continue
+			}
+			p := t.Packages[b.Package]
+			if p == nil {
+				return nil, fmt.Errorf("%s: %s: no package named %q", name, b.File, b.Package)
+			}
+			narrowed.Binaries = append(narrowed.Binaries, b)
+			narrowed.Packages[b.Package] = p
+		}
+		if len(narrowed.Binaries) == 0 {
+			sort.Strings(targets)
+			return nil, fmt.Errorf("%s pins no binary for %s; it has %s", name, target, strings.Join(targets, ", "))
+		}
+		out.Tools[name] = narrowed
+	}
+	return out, nil
 }
 
 func saveManifest(path string, m *manifest) error {

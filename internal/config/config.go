@@ -46,8 +46,29 @@ const (
 	SlotRecipient  = "recipient"
 )
 
-// DefaultFileName is looked for when --config is not given.
+// DefaultFileName is looked for when --config is not given, beside the binary
+// and in the user's config directory: places that belong to BOND.
 const DefaultFileName = "config.json"
+
+// WorkingDirFileName is looked for in the working directory when --config is not
+// given. The working directory belongs to whatever project the operator is in,
+// and a config.json there is as likely to be that project's as BOND's.
+const WorkingDirFileName = "bond.config.json"
+
+// schemaName is the file name the $schema of a control file ends in.
+const schemaName = "bond-config.schema.json"
+
+// IsControlFile reports whether data is meant as a BOND control file: it parses
+// as one, or it declares BOND's schema, which a broken control file still does.
+func IsControlFile(data []byte) bool {
+	if _, err := Parse(data); err == nil {
+		return true
+	}
+	var head struct {
+		Schema string `json:"$schema"`
+	}
+	return json.Unmarshal(data, &head) == nil && strings.HasSuffix(head.Schema, "/"+schemaName)
+}
 
 var (
 	encryptionMethods = []string{EncryptionNone, EncryptionPassphrase, EncryptionKeyfile, EncryptionRecipient}
@@ -135,21 +156,30 @@ type Resolved struct {
 	// SigningKey is the path of a writer key file, or empty for unsigned
 	// containers.
 	SigningKey string
+
+	// DefaultOutputPath and DefaultWorkPath report that the control file left
+	// the path out, so it is the built-in default beside the binary. That is
+	// right for the portable layout and wrong for an installed binary, and the
+	// caller decides which this is.
+	DefaultOutputPath bool
+	DefaultWorkPath   bool
 }
 
 // Defaults are the built-in settings, used for anything the control file omits.
 func Defaults() Resolved {
 	return Resolved{
-		CompressionLevel: 5,
-		EncryptionMethod: EncryptionPassphrase,
-		RecoveryPercent:  10,
-		ShardBytes:       4 << 20,
-		MaxVolumeBytes:   0,
-		HashAlgorithm:    HashSHA384,
-		StoreFileIndex:   true,
-		FollowSymlinks:   true,
-		OutputPath:       "{{TOOL_DIR}}/output",
-		WorkPath:         "{{TOOL_DIR}}/work",
+		CompressionLevel:  5,
+		EncryptionMethod:  EncryptionPassphrase,
+		RecoveryPercent:   10,
+		ShardBytes:        4 << 20,
+		MaxVolumeBytes:    0,
+		HashAlgorithm:     HashSHA384,
+		StoreFileIndex:    true,
+		FollowSymlinks:    true,
+		OutputPath:        "{{TOOL_DIR}}/output",
+		WorkPath:          "{{TOOL_DIR}}/work",
+		DefaultOutputPath: true,
+		DefaultWorkPath:   true,
 	}
 }
 
@@ -508,9 +538,11 @@ func merge(base Resolved, s *Settings) Resolved {
 	}
 	if s.OutputPath != nil {
 		out.OutputPath = *s.OutputPath
+		out.DefaultOutputPath = false
 	}
 	if s.WorkPath != nil {
 		out.WorkPath = *s.WorkPath
+		out.DefaultWorkPath = false
 	}
 	if s.SigningKey != nil {
 		out.SigningKey = *s.SigningKey

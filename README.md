@@ -283,12 +283,25 @@ new file, leaving the damaged one alone.
 
 ## The control file
 
-A JSON file – `config.json` beside the binary or in the working directory unless `--config` says otherwise – listing
-targets and the settings that govern them. [config.sample.json](config.sample.json) is a worked
-example, and [schema/bond-config.schema.json](schema/bond-config.schema.json) is a JSON Schema, so an editor can
-validate it while you type. Unknown keys are a load error: a misspelled filter would otherwise silently widen a
-backup. `outputPath`, `workPath`, `signingKey` and the `path` of a key slot take the placeholders `{{HOME}}`, `{{TOOL_DIR}}`,
-`{{TARGET_ID}}`, `{{DATE}}` and `{{TIMESTAMP}}`.
+A JSON file listing targets and the settings that govern them. Unless `--config` names one, BOND reads the first of:
+
+1. `bond.config.json` in the working directory.
+2. `config.json` beside the binary, the layout of the release archives.
+3. `config.json` in the user's config directory, for an installed binary such as one from a package manager:
+   `$XDG_CONFIG_HOME/bond`, usually `~/.config/bond`, on Linux, `~/Library/Application Support/bond` on macOS and
+   `%AppData%\bond` on Windows.
+
+[config.sample.json](config.sample.json) is a worked example, and
+[schema/bond-config.schema.json](schema/bond-config.schema.json) is a JSON Schema, so an editor can validate it while
+you type. Unknown keys are a load error: a misspelled filter would otherwise silently widen a backup.
+
+`outputPath`, `workPath`, `signingKey` and the `path` of a key slot take the placeholders `{{HOME}}`, `{{TOOL_DIR}}`
+(the directory holding the binary), `{{CONFIG_DIR}}` (the directory holding the control file), `{{TARGET_ID}}`,
+`{{DATE}}` and `{{TIMESTAMP}}`. The defaults for `outputPath` and `workPath` are `{{TOOL_DIR}}/output` and
+`{{TOOL_DIR}}/work`, made for the portable layout, and BOND uses them only when the control file sits beside the
+binary. Anywhere else – typically with an installed binary, whose directory is something like `/usr/bin` – a backup
+that would fall back on them is refused before the first target, naming the setting to add. The sample sets both to
+`{{CONFIG_DIR}}`, which is the same place in the portable layout and a writable one for an installed binary.
 
 Each source is a directory tree plus filters, all matched against the source-relative path with `/` separators
 (case-insensitively on Windows and macOS):

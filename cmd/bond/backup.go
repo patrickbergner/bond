@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/patrickbergner/bond/internal/archive"
@@ -47,7 +48,9 @@ Creates one container per selected target.
 
 options:
   -c, --config <path>   control file to read
-                        (default: config.json beside the binary or in the current directory)
+                        (default: bond.config.json in the current directory, else
+                        config.json beside the binary or in the user's config
+                        directory, such as ~/.config/bond)
   -t, --target <id>     back up only this target; repeat for several
                         (default: every target not marked skip)
   -n, --dry-run         enumerate and report what would be backed up, writing nothing
@@ -77,6 +80,9 @@ options:
 	if err != nil {
 		return err
 	}
+	if err := checkDefaultPaths(selected, config.BaseVars(path), workDir); err != nil {
+		return err
+	}
 
 	if dryRun {
 		return dryRunBackup(cfg, selected, path, workDir, verbose)
@@ -87,7 +93,7 @@ options:
 func createBackups(cfg *config.Config, targets []*config.Target, configPath, workDir string, verbose, ignoreErrors bool, keys *keyFlags) error {
 	ctx := rootCtx
 	now := time.Now()
-	base := config.BaseVars()
+	base := config.BaseVars(configPath)
 
 	fmt.Printf("control file  %s\n", configPath)
 	fmt.Printf("targets       %d of %s selected\n", len(targets), ui.Items(len(cfg.Targets), "target", "targets"))
@@ -312,7 +318,7 @@ func describeSettings(s config.Resolved) {
 
 func dryRunBackup(cfg *config.Config, targets []*config.Target, configPath, workDir string, verbose bool) error {
 	now := time.Now()
-	base := config.BaseVars()
+	base := config.BaseVars(configPath)
 
 	fmt.Printf("control file  %s\n", configPath)
 	fmt.Printf("targets       %d of %s selected\n", len(targets), ui.Items(len(cfg.Targets), "target", "targets"))
@@ -445,8 +451,69 @@ func workPath(settings config.Resolved, vars config.Vars, override string) (stri
 	return dir, nil
 }
 
+// checkDefaultPaths refuses a run that would put containers or work files at
+// their built-in defaults beside the binary although the control file is not
+// there. The defaults are made for the portable layout, where the two share a
+// directory. For an installed binary they point into something like /usr/bin:
+// a backup there fails on permissions at best, and run as root it litters a
+// system directory. Either way the operator is better served by being told,
+// before the first target, which setting to add.
+func checkDefaultPaths(targets []*config.Target, base config.Vars, workDir string) error {
+	toolDir, configDir := base[config.VarToolDir], base[config.VarConfigDir]
+	if toolDir == "" || configDir == "" || sameDir(toolDir, configDir) {
+		return nil
+	}
+
+	var output, work bool
+	for _, t := range targets {
+		s := t.Effective()
+		output = output || s.DefaultOutputPath
+		work = work || (s.DefaultWorkPath && workDir == "")
+	}
+
+	var unset, examples []string
+	if output {
+		unset = append(unset, "outputPath")
+		examples = append(examples, `"outputPath": "{{CONFIG_DIR}}/output"`)
+	}
+	if work {
+		unset = append(unset, "workPath")
+		examples = append(examples, `"workPath": "{{CONFIG_DIR}}/work"`)
+	}
+	if len(unset) == 0 {
+		return nil
+	}
+	return fmt.Errorf("the control file does not set %s, and the default would put files beside the binary in %s"+
+		" rather than beside the control file in %s; add to its settings, for example, %s",
+		strings.Join(unset, " or "), toolDir, configDir, strings.Join(examples, " and "))
+}
+
+// sameDir reports whether a and b name the same directory, however each is
+// spelled; one that cannot be read counts as different.
+func sameDir(a, b string) bool {
+	ia, err := os.Stat(a)
+	if err != nil {
+		return false
+	}
+	ib, err := os.Stat(b)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(ia, ib)
+}
+
 // findConfig resolves the control file: the one named on the command line, or
-// config.json in the working directory, or config.json beside the binary.
+// bond.config.json in the working directory, or config.json beside the binary
+// or in the user's config directory, in that order.
+//
+// The user's config directory ($XDG_CONFIG_HOME/bond on Linux) is for an
+// installed binary, whose own directory is something like /usr/bin. It comes
+// last so that a portable setup keeps the control file it always had.
+//
+// The working directory was once searched for config.json. A BOND control file
+// still lying there under that name is refused rather than passed over: the
+// search would otherwise move on to another file, and a backup run from that
+// directory would quietly switch to that file's targets.
 func findConfig(given string) (string, error) {
 	if given != "" {
 		if _, err := os.Stat(given); err != nil {
@@ -455,20 +522,56 @@ func findConfig(given string) (string, error) {
 		return given, nil
 	}
 
-	var looked []string
-	candidates := []string{config.DefaultFileName}
-	if vars := config.BaseVars(); vars[config.VarToolDir] != "" {
+	if _, err := os.Stat(config.WorkingDirFileName); err == nil {
+		return config.WorkingDirFileName, nil
+	}
+	looked := []string{absOrSelf(config.WorkingDirFileName)}
+
+	var candidates []string
+	if vars := config.BaseVars(""); vars[config.VarToolDir] != "" {
 		candidates = append(candidates, filepath.Join(vars[config.VarToolDir], config.DefaultFileName))
 	}
+	if dir, err := os.UserConfigDir(); err == nil {
+		candidates = append(candidates, filepath.Join(dir, "bond", config.DefaultFileName))
+	}
+
+	// The old name in the working directory, if what it holds is BOND's. It is
+	// fine when it is the very file found next, as when bond runs from its own
+	// directory.
+	var stray os.FileInfo
+	if data, err := os.ReadFile(config.DefaultFileName); err == nil && config.IsControlFile(data) {
+		stray, _ = os.Stat(config.DefaultFileName)
+	}
+	refuse := func(instead string) error {
+		msg := "%[1]s in the working directory is a BOND control file, but there BOND reads only %[2]s;" +
+			" rename it to %[2]s to use it, or name the control file to use with --config"
+		if instead != "" {
+			return badUsage(msg+" (left as it is, it would be passed over for %[3]s)", config.DefaultFileName, config.WorkingDirFileName, instead)
+		}
+		return badUsage(msg, config.DefaultFileName, config.WorkingDirFileName)
+	}
+
 	for _, c := range candidates {
-		if _, err := os.Stat(c); err == nil {
-			return c, nil
-		}
-		abs, err := filepath.Abs(c)
+		info, err := os.Stat(c)
 		if err != nil {
-			abs = c
+			looked = append(looked, absOrSelf(c))
+			continue
 		}
-		looked = append(looked, abs)
+		if stray != nil && !os.SameFile(stray, info) {
+			return "", refuse(absOrSelf(c))
+		}
+		return c, nil
+	}
+	if stray != nil {
+		return "", refuse("")
 	}
 	return "", badUsage("no control file found; looked for %v – name one with --config", looked)
+}
+
+// absOrSelf is path made absolute for a message, or path itself if that fails.
+func absOrSelf(path string) string {
+	if abs, err := filepath.Abs(path); err == nil {
+		return abs
+	}
+	return path
 }

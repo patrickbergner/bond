@@ -117,10 +117,18 @@ are accepted and corrected.
 THE CONTROL FILE
 ------------------------------------------------------------------------------
 
-A JSON file, config.json beside the binary or in the working directory unless
---config says otherwise, listing targets and the settings that govern them.
+A JSON file listing targets and the settings that govern them. Unless
+--config names one, BOND reads the first of: bond.config.json in the working
+directory; config.json beside the binary; config.json in the user's config
+directory (~/.config/bond on Linux, ~/Library/Application Support/bond on
+macOS, %AppData%\bond on Windows).
+
 config.sample.json in this folder is a worked example. It declares a $schema,
 so an editor that honours it gives completion and validation while you type.
+Its outputPath and workPath use {{CONFIG_DIR}}, the folder holding the control
+file; {{TOOL_DIR}}, {{HOME}}, {{TARGET_ID}}, {{DATE}} and {{TIMESTAMP}} work
+there too. Left out, both default to this folder ({{TOOL_DIR}}), and BOND then
+refuses a control file kept anywhere else rather than write beside the binary.
 
 Unknown keys are a load error: a misspelled filter would otherwise silently
 widen a backup.
